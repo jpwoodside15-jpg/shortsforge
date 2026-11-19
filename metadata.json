@@ -1,0 +1,6 @@
+{
+  "name": "ShortsForge AI - Viral YouTube Shorts Studio",
+  "description": "All-in-one AI YouTube Shorts growth suite: Sync to Social (TikTok & Instagram Reels Watermark-Free Export), Psychological Trigger Engine, Smart Revenue Benchmarking, Revenue Intelligence Dashboard, AI Cinematic Editor, and YouTube Direct Upload Simplicity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
