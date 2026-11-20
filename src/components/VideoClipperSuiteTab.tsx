@@ -1,15 +1,25 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   Scissors, Video, Sparkles, Upload, Play, Pause, Volume2, 
   VolumeX, RefreshCw, Check, Copy, AlertTriangle, ShieldCheck, 
   Terminal, Youtube, Sliders, Layers, Eye, Smartphone, Download, 
   ArrowRight, Maximize2, Zap, Flame, ExternalLink, Calendar, Lock, Globe, EyeOff,
   CheckCircle2, Film, Clapperboard, Camera, Image as ImageIcon, Share2,
-  Shield, DollarSign, Award, ChevronDown, ChevronUp, Info, Hash, MessageSquare
+  Shield, DollarSign, Award, ChevronDown, ChevronUp, Info, Hash, MessageSquare,
+  Plus, Wand2, X
 } from 'lucide-react';
 
 import { ScrapedVideosVaultDrawer, ScrapedVideoItem } from './ScrapedVideosVaultDrawer';
 import { RedditProductionModule } from './RedditProductionModule';
+import {
+  AppliedBoundaryTransition,
+  CinematicTransitionId,
+  CinematicTransitionsDrawer,
+  ClipBoundarySlot,
+  TRANSITION_DRAG_MIME,
+  getTransitionById,
+  renderTransitionIcon
+} from './CinematicTransitionsDrawer';
 
 interface VideoClipperSuiteTabProps {
   initialTrimStart?: number;
@@ -38,7 +48,7 @@ const SAMPLE_VIDEOS: SampleVideoPreset[] = [
     name: '4K FPV Drone City Skim',
     category: 'Aerial & FPV',
     duration: 38,
-    videoUrl: '/samples/sample_blazes.mp4',
+    videoUrl: '/samples/sample_meltdowns.mp4',
     description: 'High-speed cinematic low-altitude flight through metropolis architecture.'
   },
   {
@@ -89,6 +99,32 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
   // Clipping Range Handles (Sub-second)
   const [inPointSec, setInPointSec] = useState<number>(initialTrimStart);
   const [outPointSec, setOutPointSec] = useState<number>(Math.min(initialTrimEnd, 38));
+
+  // Cinematic Transitions Drawer & Clip Boundaries State
+  const [showTransitionsDrawer, setShowTransitionsDrawer] = useState<boolean>(false);
+  const [cutPoints, setCutPoints] = useState<Array<{ id: string; sec: number }>>([
+    { id: 'cut_hook', sec: 9 },
+    { id: 'cut_payoff', sec: 20 }
+  ]);
+  const [appliedTransitions, setAppliedTransitions] = useState<
+    Record<string, AppliedBoundaryTransition>
+  >({
+    cut_hook: {
+      boundaryId: 'cut_hook',
+      transitionId: 'zoom_punch',
+      durationSec: 0.35
+    }
+  });
+  const [selectedBoundaryId, setSelectedBoundaryId] = useState<string | null>('cut_hook');
+  const [draggingTransitionId, setDraggingTransitionId] =
+    useState<CinematicTransitionId | null>(null);
+  const [dragOverBoundaryId, setDragOverBoundaryId] = useState<string | null>(null);
+  const [activeTransitionFx, setActiveTransitionFx] = useState<{
+    transitionId: CinematicTransitionId;
+    durationSec: number;
+  } | null>(null);
+  const transitionFxTimerRef = useRef<number | null>(null);
+  const lastTriggeredBoundaryRef = useRef<{ id: string; triggeredAt: number } | null>(null);
 
   // Editing & Framing Controls
   const [framingMode, setFramingMode] = useState<'9-16-crop' | 'split-screen' | 'blurred-pillar'>('9-16-crop');
@@ -214,17 +250,281 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
     if (initialTrimEnd !== undefined) setOutPointSec(initialTrimEnd);
   }, [initialTrimStart, initialTrimEnd]);
 
+  // Active cut points clamped strictly inside [inPointSec + 1, outPointSec - 1]
+  const validCutPoints = useMemo(() => {
+    const minCut = inPointSec + 1;
+    const maxCut = outPointSec - 1;
+    if (maxCut <= minCut) return [];
+    const seen = new Set<number>();
+    return cutPoints
+      .map((cp) => ({ id: cp.id, sec: Math.round(cp.sec * 10) / 10 }))
+      .filter((cp) => {
+        if (cp.sec < minCut || cp.sec > maxCut || seen.has(cp.sec)) return false;
+        seen.add(cp.sec);
+        return true;
+      })
+      .sort((a, b) => a.sec - b.sec);
+  }, [cutPoints, inPointSec, outPointSec]);
+
+  const clipSegments = useMemo(() => {
+    const edges = [inPointSec, ...validCutPoints.map((c) => c.sec), outPointSec];
+    const roleNames = ['Hook', 'Build', 'Twist', 'Payoff', 'Loop'];
+    return edges.slice(0, -1).map((startSec, idx) => {
+      const endSec = edges[idx + 1];
+      const role = roleNames[idx] || `Beat ${idx + 1}`;
+      return {
+        id: `seg_${idx}`,
+        index: idx,
+        label: `Clip ${idx + 1} · ${role}`,
+        shortLabel: `Clip ${idx + 1}`,
+        startSec,
+        endSec,
+        durationSec: Math.max(0.5, Math.round((endSec - startSec) * 10) / 10)
+      };
+    });
+  }, [inPointSec, outPointSec, validCutPoints]);
+
+  const clipBoundaries = useMemo<ClipBoundarySlot[]>(() => {
+    const slots: ClipBoundarySlot[] = [
+      {
+        id: 'intro',
+        label: 'Intro Boundary',
+        timeSec: inPointSec,
+        kind: 'intro',
+        leftClipLabel: 'Start',
+        rightClipLabel: clipSegments[0]?.shortLabel || 'Clip 1'
+      }
+    ];
+
+    validCutPoints.forEach((cp, idx) => {
+      slots.push({
+        id: cp.id,
+        label: `Cut #${idx + 1} (${clipSegments[idx]?.shortLabel || `Clip ${idx + 1}`} → ${clipSegments[idx + 1]?.shortLabel || `Clip ${idx + 2}`})`,
+        timeSec: cp.sec,
+        kind: 'cut',
+        leftClipLabel: clipSegments[idx]?.shortLabel || `Clip ${idx + 1}`,
+        rightClipLabel: clipSegments[idx + 1]?.shortLabel || `Clip ${idx + 2}`
+      });
+    });
+
+    slots.push({
+      id: 'outro',
+      label: 'Loop / Out Boundary',
+      timeSec: outPointSec,
+      kind: 'outro',
+      leftClipLabel: clipSegments[clipSegments.length - 1]?.shortLabel || 'Clip 1',
+      rightClipLabel: 'Loop'
+    });
+
+    return slots;
+  }, [clipSegments, inPointSec, outPointSec, validCutPoints]);
+
+  const triggerTransitionPreview = (
+    transitionId: CinematicTransitionId,
+    durationSec?: number,
+    seekTimeSec?: number
+  ) => {
+    const preset = getTransitionById(transitionId);
+    const effectiveDur = durationSec ?? preset?.defaultDurationSec ?? 0.3;
+
+    if (transitionFxTimerRef.current !== null) {
+      window.clearTimeout(transitionFxTimerRef.current);
+    }
+
+    if (seekTimeSec !== undefined && videoRef.current) {
+      const clampedSeek = Math.max(
+        inPointSec,
+        Math.min(outPointSec - 0.1, seekTimeSec)
+      );
+      videoRef.current.currentTime = clampedSeek;
+      setCurrentTime(clampedSeek);
+    }
+
+    setActiveTransitionFx({ transitionId, durationSec: effectiveDur });
+    playSynthesizedSfx(preset?.sfxType || 'whoosh');
+
+    transitionFxTimerRef.current = window.setTimeout(() => {
+      setActiveTransitionFx(null);
+      transitionFxTimerRef.current = null;
+    }, Math.max(280, Math.round(effectiveDur * 1000)));
+  };
+
+  useEffect(() => {
+    return () => {
+      if (transitionFxTimerRef.current !== null) {
+        window.clearTimeout(transitionFxTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleAssignTransitionToBoundary = (
+    boundaryId: string,
+    transitionId: CinematicTransitionId,
+    durationSec?: number
+  ) => {
+    const preset = getTransitionById(transitionId);
+    if (!preset) return;
+    const effectiveDur = durationSec ?? preset.defaultDurationSec;
+    const boundary = clipBoundaries.find((b) => b.id === boundaryId);
+
+    setAppliedTransitions((prev) => ({
+      ...prev,
+      [boundaryId]: {
+        boundaryId,
+        transitionId,
+        durationSec: effectiveDur
+      }
+    }));
+    setSelectedBoundaryId(boundaryId);
+    triggerTransitionPreview(transitionId, effectiveDur, boundary?.timeSec);
+    showToast(
+      `Applied ${preset.name} (${effectiveDur.toFixed(2)}s) to ${boundary?.label || boundaryId}.`
+    );
+  };
+
+  const handleApplyTransitionToAllBoundaries = (
+    transitionId: CinematicTransitionId,
+    durationSec?: number
+  ) => {
+    const preset = getTransitionById(transitionId);
+    if (!preset) return;
+    const effectiveDur = durationSec ?? preset.defaultDurationSec;
+    const nextMap: Record<string, AppliedBoundaryTransition> = {};
+    clipBoundaries.forEach((b) => {
+      nextMap[b.id] = {
+        boundaryId: b.id,
+        transitionId,
+        durationSec: effectiveDur
+      };
+    });
+    setAppliedTransitions(nextMap);
+    triggerTransitionPreview(transitionId, effectiveDur);
+    showToast(
+      `Applied ${preset.name} (${effectiveDur.toFixed(2)}s) across all ${clipBoundaries.length} clip boundaries.`
+    );
+  };
+
+  const handleRemoveTransitionFromBoundary = (boundaryId: string) => {
+    setAppliedTransitions((prev) => {
+      const next = { ...prev };
+      delete next[boundaryId];
+      return next;
+    });
+  };
+
+  const handleClearAllTransitions = () => {
+    setAppliedTransitions({});
+    showToast('Cleared all clip boundary transitions.');
+  };
+
+  const handleSplitClipAtPlayhead = () => {
+    const candidate =
+      currentTime > inPointSec + 1.2 && currentTime < outPointSec - 1.2
+        ? Math.round(currentTime * 10) / 10
+        : (() => {
+            const longest = [...clipSegments].sort(
+              (a, b) => b.durationSec - a.durationSec
+            )[0];
+            if (!longest || longest.durationSec < 2.2) return null;
+            return Math.round(((longest.startSec + longest.endSec) / 2) * 10) / 10;
+          })();
+
+    if (candidate === null) {
+      showToast('Move the playhead or extend the clip range to add another cut boundary.');
+      return;
+    }
+    if (validCutPoints.some((c) => Math.abs(c.sec - candidate) < 1)) {
+      showToast('A clip boundary already exists within 1s of that timestamp.');
+      return;
+    }
+    const newId = `cut_${Date.now()}`;
+    setCutPoints((prev) =>
+      [...prev, { id: newId, sec: candidate }].sort((a, b) => a.sec - b.sec)
+    );
+    setSelectedBoundaryId(newId);
+    playSynthesizedSfx('snap');
+    showToast(`Added clip boundary at ${candidate.toFixed(1)}s. Drag a transition onto it.`);
+  };
+
+  const handleRemoveCutPoint = (cutId: string) => {
+    setCutPoints((prev) => prev.filter((cp) => cp.id !== cutId));
+    setAppliedTransitions((prev) => {
+      const next = { ...prev };
+      delete next[cutId];
+      return next;
+    });
+  };
+
+  const handleBoundaryDragOver = (e: React.DragEvent, boundaryId: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    if (dragOverBoundaryId !== boundaryId) {
+      setDragOverBoundaryId(boundaryId);
+    }
+  };
+
+  const handleBoundaryDrop = (e: React.DragEvent, boundary: ClipBoundarySlot) => {
+    e.preventDefault();
+    setDragOverBoundaryId(null);
+    const mimeRaw = e.dataTransfer.getData(TRANSITION_DRAG_MIME);
+    let transitionIdCandidate = '';
+    let customDuration: number | undefined;
+
+    if (mimeRaw) {
+      try {
+        const parsed = JSON.parse(mimeRaw);
+        transitionIdCandidate = String(parsed?.id || '');
+        if (typeof parsed?.durationSec === 'number' && Number.isFinite(parsed.durationSec)) {
+          customDuration = parsed.durationSec;
+        }
+      } catch {
+        transitionIdCandidate = mimeRaw;
+      }
+    }
+    if (!transitionIdCandidate) {
+      transitionIdCandidate =
+        e.dataTransfer.getData('text/plain') || draggingTransitionId || '';
+    }
+
+    const preset = getTransitionById(transitionIdCandidate);
+    setDraggingTransitionId(null);
+    if (!preset) return;
+    handleAssignTransitionToBoundary(
+      boundary.id,
+      preset.id,
+      customDuration ?? preset.defaultDurationSec
+    );
+  };
+
   // Video time updates
   const handleTimeUpdate = () => {
     if (!videoRef.current) return;
     const time = videoRef.current.currentTime;
     setCurrentTime(time);
 
+    // Fire assigned boundary transition FX as playhead crosses cut seams
+    if (isPlaying) {
+      const now = Date.now();
+      for (const boundary of clipBoundaries) {
+        const assigned = appliedTransitions[boundary.id];
+        if (!assigned) continue;
+        const triggerWindow = Math.max(0.22, assigned.durationSec * 0.6);
+        if (Math.abs(time - boundary.timeSec) <= triggerWindow) {
+          const last = lastTriggeredBoundaryRef.current;
+          if (!last || last.id !== boundary.id || now - last.triggeredAt > 1200) {
+            lastTriggeredBoundaryRef.current = { id: boundary.id, triggeredAt: now };
+            triggerTransitionPreview(assigned.transitionId, assigned.durationSec);
+          }
+          break;
+        }
+      }
+    }
+
     // Loop bounds constraint
     if (time >= outPointSec) {
       if (isLoopPerfected) {
         videoRef.current.currentTime = inPointSec;
-        videoRef.current.play();
+        videoRef.current.play().catch(() => {});
       } else {
         videoRef.current.pause();
         setIsPlaying(false);
@@ -238,7 +538,12 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
     if (!isNaN(dur) && dur > 0) {
       setVideoDuration(Math.round(dur * 10) / 10);
       if (outPointSec > dur || outPointSec === 38) {
-        setOutPointSec(Math.min(dur, Math.max(15, dur)));
+        const nextOut = Math.min(dur, Math.max(15, dur));
+        setOutPointSec(nextOut);
+        setCutPoints([
+          { id: 'cut_hook', sec: Math.round(nextOut * 0.33 * 10) / 10 },
+          { id: 'cut_payoff', sec: Math.round(nextOut * 0.66 * 10) / 10 }
+        ]);
       }
     }
   };
@@ -253,7 +558,7 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
         videoRef.current.currentTime = inPointSec;
       }
       videoRef.current.playbackRate = playbackSpeed;
-      videoRef.current.play();
+      videoRef.current.play().catch(() => {});
       setIsPlaying(true);
     }
   };
@@ -289,7 +594,7 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
   };
 
   // SFX Synth via Web Audio API
-  const playSynthesizedSfx = (type: 'whoosh' | 'boom' | 'ding') => {
+  const playSynthesizedSfx = (type: 'whoosh' | 'boom' | 'ding' | 'zoom' | 'glitch' | 'snap') => {
     try {
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = ctx.createOscillator();
@@ -305,6 +610,33 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
         gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
         osc.start();
         osc.stop(ctx.currentTime + 0.25);
+      } else if (type === 'zoom') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(220, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(980, ctx.currentTime + 0.16);
+        osc.frequency.exponentialRampToValueAtTime(190, ctx.currentTime + 0.32);
+        gain.gain.setValueAtTime(0.28, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.32);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.32);
+      } else if (type === 'glitch') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(520, ctx.currentTime);
+        osc.frequency.setValueAtTime(140, ctx.currentTime + 0.05);
+        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1);
+        osc.frequency.setValueAtTime(210, ctx.currentTime + 0.16);
+        gain.gain.setValueAtTime(0.18, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.24);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.24);
+      } else if (type === 'snap') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(1400, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(90, ctx.currentTime + 0.09);
+        gain.gain.setValueAtTime(0.45, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.11);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.11);
       } else if (type === 'boom') {
         osc.type = 'triangle';
         osc.frequency.setValueAtTime(120, ctx.currentTime);
@@ -540,7 +872,8 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
       affiliateDisclosureAdded: true,
       advertiserGreenDollar: true,
       tags: tags.split(',').map(t => t.trim()).filter(Boolean),
-      description
+      description,
+      transitions: Object.values(appliedTransitions)
     };
     if (onSendToPipeline) {
       onSendToPipeline(pipelineItem);
@@ -557,7 +890,8 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
         duration: clipDuration,
         tags: tags.split(',').map(t => t.trim()),
         description,
-        sourceCitation: sourceCitationText
+        sourceCitation: sourceCitationText,
+        transitions: Object.values(appliedTransitions)
       });
     }
     playSynthesizedSfx('ding');
@@ -592,15 +926,63 @@ export const VideoClipperSuiteTab: React.FC<VideoClipperSuiteTabProps> = ({
   const clipDuration = Math.max(0, Math.round((outPointSec - inPointSec) * 10) / 10);
   const isShortsCompliant = clipDuration > 0 && clipDuration <= 60;
 
-  // CSS Filter string based on color preset
+  // CSS Filter string based on color preset + live transition preview FX
   const getFilterStyle = () => {
     let base = '';
     if (colorFilter === 'dopamine') base += 'saturate(1.4) contrast(1.15) brightness(1.05) ';
     if (colorFilter === 'cinematic') base += 'contrast(1.2) sepia(0.15) saturate(1.1) ';
     if (colorFilter === 'cyber') base += 'hue-rotate(200deg) contrast(1.3) saturate(1.5) ';
     if (colorFilter === 'noir') base += 'grayscale(1) contrast(1.4) brightness(0.95) ';
-    if (isMirrored) base += 'scaleX(-1) ';
+
+    if (activeTransitionFx) {
+      switch (activeTransitionFx.transitionId) {
+        case 'rgb_glitch':
+          base += 'contrast(1.65) saturate(2.2) hue-rotate(42deg) ';
+          break;
+        case 'vhs_glitch':
+          base += 'contrast(1.85) saturate(0.45) brightness(1.15) ';
+          break;
+        case 'snap_cut':
+          base += 'brightness(1.7) contrast(1.3) ';
+          break;
+        case 'flash_strobe':
+          base += 'brightness(2.1) contrast(1.1) ';
+          break;
+        case 'whip_pan':
+          base += 'blur(3px) contrast(1.15) ';
+          break;
+        case 'zoom_punch':
+        case 'zoom_out':
+        case 'beat_snap':
+          base += 'contrast(1.2) saturate(1.15) ';
+          break;
+      }
+    }
     return base.trim();
+  };
+
+  const getTransitionTransform = () => {
+    if (!activeTransitionFx) return '';
+    switch (activeTransitionFx.transitionId) {
+      case 'zoom_punch':
+        return 'scale(1.32)';
+      case 'zoom_out':
+        return 'scale(0.86)';
+      case 'rgb_glitch':
+        return 'translateX(5px) skewX(3deg) scale(1.04)';
+      case 'vhs_glitch':
+        return 'translateX(-6px) skewX(-5deg) scale(1.03)';
+      case 'snap_cut':
+        return 'scale(1.14)';
+      case 'beat_snap':
+        return 'scale(1.22) rotate(1.2deg)';
+      case 'whip_pan':
+        return 'translateX(-18%) scale(1.12)';
+      case 'flash_strobe':
+        return 'scale(1.05)';
+      default:
+        return '';
+    }
   };
 
   // Python and curl scripts for Developer API Exporter
@@ -861,10 +1243,42 @@ if __name__ == "__main__":
                     directorialEffect === 'dutch_tilt' ? 'rotate(-3.5deg) scale(1.08)' :
                     directorialEffect === 'speed_ramp' ? 'scale(1.06)' :
                     directorialEffect === 'whip_pan' ? 'translateX(14px)' : ''
-                  }`,
-                  transition: 'transform 0.15s ease-out'
+                  } ${getTransitionTransform()}`,
+                  transition: activeTransitionFx
+                    ? 'transform 0.14s cubic-bezier(0.16, 1, 0.3, 1), filter 0.12s ease-out'
+                    : 'transform 0.15s ease-out'
                 }}
               />
+            )}
+
+            {/* Live Cinematic Transition Visual FX Overlay */}
+            {activeTransitionFx && (
+              <div className="absolute inset-0 pointer-events-none z-28 overflow-hidden">
+                {(activeTransitionFx.transitionId === 'rgb_glitch' ||
+                  activeTransitionFx.transitionId === 'vhs_glitch') && (
+                  <>
+                    <div className="absolute inset-x-0 top-[22%] h-6 bg-cyan-400/25 mix-blend-screen translate-x-2" />
+                    <div className="absolute inset-x-0 top-[54%] h-4 bg-red-500/30 mix-blend-screen -translate-x-2" />
+                    <div className="absolute inset-x-0 bottom-[18%] h-3 bg-white/20 mix-blend-overlay translate-x-1" />
+                  </>
+                )}
+                {(activeTransitionFx.transitionId === 'snap_cut' ||
+                  activeTransitionFx.transitionId === 'flash_strobe') && (
+                  <div className="absolute inset-0 bg-white/45 transition-opacity duration-150" />
+                )}
+                {(activeTransitionFx.transitionId === 'zoom_punch' ||
+                  activeTransitionFx.transitionId === 'zoom_out' ||
+                  activeTransitionFx.transitionId === 'whip_pan' ||
+                  activeTransitionFx.transitionId === 'beat_snap') && (
+                  <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_48%,rgba(0,0,0,0.65)_100%)]" />
+                )}
+                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/85 border border-zinc-700 rounded-md px-2.5 py-1 text-[10px] font-mono text-white whitespace-nowrap flex items-center gap-1.5">
+                  <Wand2 className="w-3 h-3 text-red-400" />
+                  <span>
+                    {getTransitionById(activeTransitionFx.transitionId)?.name} ({activeTransitionFx.durationSec.toFixed(2)}s)
+                  </span>
+                </div>
+              </div>
             )}
 
             {/* Dynamic Statistics / Data Ticker Overlay */}
@@ -1067,9 +1481,9 @@ if __name__ == "__main__":
         {/* Right Column: Timeline Clipper, Editing Suite & YouTube Uploader */}
         <div className="lg:col-span-7 space-y-5">
           
-          {/* SECTION 1: TIMELINE CLIPPER (Mark In & Mark Out) */}
+          {/* SECTION 1: TIMELINE CLIPPER (Mark In & Mark Out + Clip Boundaries & Cinematic Transitions) */}
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-3">
               <div className="flex items-center gap-2">
                 <Scissors className="w-4 h-4 text-red-400" />
                 <h3 className="text-xs font-bold text-white uppercase tracking-wider">
@@ -1077,57 +1491,105 @@ if __name__ == "__main__":
                 </h3>
               </div>
 
-              <div className="flex items-center gap-2">
-                <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-full ${
-                  isShortsCompliant 
-                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' 
-                    : 'bg-red-500/10 text-red-400 border border-red-500/30'
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowTransitionsDrawer((prev) => !prev)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer transition-colors border ${
+                    showTransitionsDrawer
+                      ? 'bg-red-600 text-white border-red-500'
+                      : 'bg-zinc-950 hover:bg-zinc-800 text-zinc-100 border-zinc-700'
+                  }`}
+                >
+                  <Wand2 className="w-3.5 h-3.5" />
+                  <span>Cinematic Transitions</span>
+                  <span className="font-mono tabular-nums text-[11px] opacity-85">
+                    ({Object.keys(appliedTransitions).length})
+                  </span>
+                </button>
+
+                <span className={`text-xs font-mono tabular-nums font-semibold ${
+                  isShortsCompliant ? 'text-emerald-400' : 'text-red-400'
                 }`}>
-                  Clip: {clipDuration}s {isShortsCompliant ? '✓ Shorts (<60s)' : '⚠️ Exceeds 60s'}
+                  {clipDuration}s {isShortsCompliant ? '· Shorts OK' : '· Exceeds 60s'}
                 </span>
               </div>
             </div>
 
-            {/* Quick Trim Preset Buttons */}
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] text-zinc-400 font-semibold">Quick Trim:</span>
+            {/* Collapsible Cinematic Transitions Drawer (Docked non-blocking for direct drag-and-drop onto timeline boundaries) */}
+            <CinematicTransitionsDrawer
+              isOpen={showTransitionsDrawer}
+              onClose={() => setShowTransitionsDrawer(false)}
+              boundaries={clipBoundaries}
+              appliedTransitions={appliedTransitions}
+              selectedBoundaryId={selectedBoundaryId}
+              draggingTransitionId={draggingTransitionId}
+              onDragStartTransition={(id) => setDraggingTransitionId(id)}
+              onDragEndTransition={() => {
+                setDraggingTransitionId(null);
+                setDragOverBoundaryId(null);
+              }}
+              onAssignTransition={handleAssignTransitionToBoundary}
+              onApplyToAllBoundaries={handleApplyTransitionToAllBoundaries}
+              onRemoveTransition={handleRemoveTransitionFromBoundary}
+              onClearAllTransitions={handleClearAllTransitions}
+              onPreviewTransition={triggerTransitionPreview}
+            />
+
+            {/* Quick Trim & Split Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] text-zinc-400 font-semibold">Quick Trim:</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInPointSec(0);
+                    setOutPointSec(Math.min(15, videoDuration));
+                  }}
+                  className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer"
+                >
+                  15s (Max Retention)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInPointSec(0);
+                    setOutPointSec(Math.min(30, videoDuration));
+                  }}
+                  className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer"
+                >
+                  30s (Story Hook)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInPointSec(0);
+                    setOutPointSec(Math.min(50, videoDuration));
+                  }}
+                  className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer"
+                >
+                  50s (Deep Value)
+                </button>
+              </div>
+
               <button
-                onClick={() => {
-                  setInPointSec(0);
-                  setOutPointSec(Math.min(15, videoDuration));
-                }}
-                className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium cursor-pointer"
+                type="button"
+                onClick={handleSplitClipAtPlayhead}
+                className="px-2.5 py-1 bg-zinc-950 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg text-xs font-medium flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
-                15s (Max Retention)
-              </button>
-              <button
-                onClick={() => {
-                  setInPointSec(0);
-                  setOutPointSec(Math.min(30, videoDuration));
-                }}
-                className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium cursor-pointer"
-              >
-                30s (Story Hook)
-              </button>
-              <button
-                onClick={() => {
-                  setInPointSec(0);
-                  setOutPointSec(Math.min(50, videoDuration));
-                }}
-                className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium cursor-pointer"
-              >
-                50s (Deep Value)
+                <Plus className="w-3.5 h-3.5 text-red-400" />
+                Split Cut
               </button>
             </div>
 
-            {/* Visual Scrubber Timeline Bar */}
-            <div className="bg-zinc-950 p-4 rounded-xl border border-zinc-800 space-y-3">
-              <div className="relative h-12 bg-zinc-900 rounded-lg overflow-hidden border border-zinc-800 flex items-center">
+            {/* Visual Scrubber Timeline Bar with Interactive Drop-Target Cut Markers */}
+            <div className="bg-zinc-950 p-4 rounded-xl border border-zinc-800 space-y-4">
+              <div className="relative h-14 bg-zinc-900 rounded-lg overflow-visible border border-zinc-800 flex items-center">
                 
                 {/* Filmstrip faux thumbnails */}
-                <div className="absolute inset-0 flex opacity-20 divide-x divide-zinc-700">
+                <div className="absolute inset-0 flex opacity-20 divide-x divide-zinc-700 rounded-lg overflow-hidden">
                   {Array.from({ length: 8 }).map((_, i) => (
-                    <div key={i} className="flex-1 bg-zinc-800 flex items-center justify-center text-[9px] text-zinc-400 font-mono">
+                    <div key={i} className="flex-1 bg-zinc-800 flex items-center justify-center text-[9px] text-zinc-400 font-mono tabular-nums">
                       {Math.round((i / 8) * videoDuration)}s
                     </div>
                   ))}
@@ -1135,33 +1597,247 @@ if __name__ == "__main__":
 
                 {/* Selected Active Trim Interval (Highlighted in Red) */}
                 {(() => {
-                  const leftPct = (inPointSec / videoDuration) * 100;
-                  const widthPct = ((outPointSec - inPointSec) / videoDuration) * 100;
+                  const leftPct = (inPointSec / Math.max(1, videoDuration)) * 100;
+                  const widthPct = ((outPointSec - inPointSec) / Math.max(1, videoDuration)) * 100;
                   return (
                     <div 
-                      className="absolute top-0 bottom-0 bg-red-600/30 border-x-2 border-red-500 z-10 flex items-center justify-between px-1"
+                      className="absolute top-0 bottom-0 bg-red-600/20 border-x-2 border-red-500 z-10 flex items-start justify-between p-1 pointer-events-none"
                       style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                     >
-                      <span className="text-[10px] font-mono font-black text-red-200 bg-red-950/80 px-1 rounded">
-                        IN: {inPointSec}s
+                      <span className="text-[10px] font-mono tabular-nums font-bold text-red-200 bg-red-950/90 px-1 rounded">
+                        IN {inPointSec}s
                       </span>
-                      <span className="text-[10px] font-mono font-black text-red-200 bg-red-950/80 px-1 rounded">
-                        OUT: {outPointSec}s
+                      <span className="text-[10px] font-mono tabular-nums font-bold text-red-200 bg-red-950/90 px-1 rounded">
+                        OUT {outPointSec}s
                       </span>
                     </div>
                   );
                 })()}
 
+                {/* Drop-Target Clip Boundary Markers Directly on the Timeline */}
+                {clipBoundaries.map((boundary) => {
+                  const pct = Math.max(
+                    1,
+                    Math.min(99, (boundary.timeSec / Math.max(1, videoDuration)) * 100)
+                  );
+                  const assigned = appliedTransitions[boundary.id];
+                  const preset = assigned ? getTransitionById(assigned.transitionId) : undefined;
+                  const isDragHover = dragOverBoundaryId === boundary.id;
+                  const isSelected = selectedBoundaryId === boundary.id;
+
+                  return (
+                    <div
+                      key={boundary.id}
+                      onDragOver={(e) => handleBoundaryDragOver(e, boundary.id)}
+                      onDragEnter={(e) => handleBoundaryDragOver(e, boundary.id)}
+                      onDragLeave={() => {
+                        if (dragOverBoundaryId === boundary.id) setDragOverBoundaryId(null);
+                      }}
+                      onDrop={(e) => handleBoundaryDrop(e, boundary)}
+                      onClick={() => {
+                        setSelectedBoundaryId(boundary.id);
+                        if (preset && assigned) {
+                          triggerTransitionPreview(preset.id, assigned.durationSec, boundary.timeSec);
+                        } else if (videoRef.current) {
+                          videoRef.current.currentTime = boundary.timeSec;
+                          setCurrentTime(boundary.timeSec);
+                        }
+                      }}
+                      style={{ left: `${pct}%` }}
+                      title={`${boundary.label} (${boundary.timeSec.toFixed(1)}s) — ${preset ? `${preset.name} (${assigned.durationSec.toFixed(2)}s)` : 'Drop transition here'}`}
+                      className={`absolute top-0 bottom-0 -translate-x-1/2 z-20 flex flex-col items-center justify-center cursor-pointer transition-transform ${
+                        isDragHover ? 'scale-125 z-30' : ''
+                      }`}
+                    >
+                      <div
+                        className={`w-0.5 h-full ${
+                          isDragHover
+                            ? 'bg-amber-400'
+                            : preset
+                              ? 'bg-emerald-400/80'
+                              : draggingTransitionId
+                                ? 'bg-amber-400/70'
+                                : 'bg-zinc-500/60'
+                        }`}
+                      />
+                      <div
+                        className={`absolute top-1/2 -translate-y-1/2 w-6 h-6 rounded-md border flex items-center justify-center transition-all ${
+                          isDragHover
+                            ? 'bg-amber-500 border-amber-200 text-zinc-950 shadow-lg'
+                            : preset
+                              ? `bg-zinc-950 ${preset.borderClass} ${preset.accentClass}`
+                              : draggingTransitionId
+                                ? 'bg-zinc-950 border-dashed border-amber-400 text-amber-300'
+                                : isSelected
+                                  ? 'bg-zinc-900 border-red-400 text-white'
+                                  : 'bg-zinc-950 border-zinc-700 text-zinc-400 hover:border-zinc-500'
+                        }`}
+                      >
+                        {preset ? (
+                          renderTransitionIcon(preset.id, 'w-3 h-3')
+                        ) : (
+                          <Wand2 className="w-3 h-3" />
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+
                 {/* Current Playhead indicator */}
                 {(() => {
-                  const playPct = (currentTime / videoDuration) * 100;
+                  const playPct = (currentTime / Math.max(1, videoDuration)) * 100;
                   return (
                     <div 
-                      className="absolute top-0 bottom-0 w-0.5 bg-white z-20 pointer-events-none"
+                      className="absolute top-0 bottom-0 w-0.5 bg-white z-25 pointer-events-none"
                       style={{ left: `${playPct}%` }}
                     />
                   );
                 })()}
+              </div>
+
+              {/* Clip Segments & Explicit Drag-and-Drop Boundary Seams */}
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <span className="text-zinc-300 font-semibold">
+                    Clip Boundaries ({clipSegments.length} segments · {clipBoundaries.length} transition seams)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowTransitionsDrawer(true)}
+                    className="text-red-400 hover:text-red-300 font-medium cursor-pointer"
+                  >
+                    {showTransitionsDrawer
+                      ? 'Drag Zoom, Glitch, or Snap onto any seam below'
+                      : 'Open Cinematic Transitions Drawer'}
+                  </button>
+                </div>
+
+                <div className="flex items-stretch gap-1.5 overflow-x-auto pb-1">
+                  {clipBoundaries.map((boundary, bIdx) => {
+                    const assigned = appliedTransitions[boundary.id];
+                    const preset = assigned ? getTransitionById(assigned.transitionId) : undefined;
+                    const isDragHover = dragOverBoundaryId === boundary.id;
+                    const isSelected = selectedBoundaryId === boundary.id;
+                    const segmentAfter = bIdx < clipSegments.length ? clipSegments[bIdx] : null;
+                    const cutIdx = boundary.kind === 'cut' ? bIdx - 1 : -1;
+
+                    return (
+                      <React.Fragment key={boundary.id}>
+                        {/* Boundary Drop Zone */}
+                        <div
+                          onDragOver={(e) => handleBoundaryDragOver(e, boundary.id)}
+                          onDragEnter={(e) => handleBoundaryDragOver(e, boundary.id)}
+                          onDragLeave={() => {
+                            if (dragOverBoundaryId === boundary.id) setDragOverBoundaryId(null);
+                          }}
+                          onDrop={(e) => handleBoundaryDrop(e, boundary)}
+                          onClick={() => {
+                            setSelectedBoundaryId(boundary.id);
+                            if (preset && assigned) {
+                              triggerTransitionPreview(
+                                preset.id,
+                                assigned.durationSec,
+                                boundary.timeSec
+                              );
+                            } else if (!showTransitionsDrawer) {
+                              setShowTransitionsDrawer(true);
+                            }
+                          }}
+                          className={`min-w-[96px] shrink-0 rounded-lg border px-2 py-2 flex flex-col justify-between gap-1 cursor-pointer transition-all ${
+                            isDragHover
+                              ? 'bg-amber-500/20 border-amber-400 ring-1 ring-amber-400/50 scale-[1.03]'
+                              : preset
+                                ? `${preset.bgTintClass} ${preset.borderClass}`
+                                : draggingTransitionId
+                                  ? 'bg-zinc-900 border-dashed border-amber-400/80'
+                                  : isSelected
+                                    ? 'bg-zinc-900 border-red-500/60'
+                                    : 'bg-zinc-900/70 border-dashed border-zinc-700 hover:border-zinc-500'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="text-[10px] font-mono tabular-nums text-zinc-400">
+                              {boundary.timeSec.toFixed(1)}s
+                            </span>
+                            <div className="flex items-center gap-0.5">
+                              {preset && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRemoveTransitionFromBoundary(boundary.id);
+                                  }}
+                                  aria-label={`Remove transition from ${boundary.label}`}
+                                  className="text-zinc-500 hover:text-red-400 cursor-pointer"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              )}
+                              {!preset && boundary.kind === 'cut' && validCutPoints.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRemoveCutPoint(boundary.id);
+                                  }}
+                                  aria-label={`Remove cut at ${boundary.timeSec.toFixed(1)}s`}
+                                  title="Remove cut boundary"
+                                  className="text-zinc-600 hover:text-red-400 cursor-pointer"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {preset ? (
+                            <div className="flex items-center gap-1 min-w-0">
+                              <span className={`${preset.accentClass} shrink-0`}>
+                                {renderTransitionIcon(preset.id, 'w-3 h-3')}
+                              </span>
+                              <span className="text-[11px] font-semibold text-white truncate">
+                                {preset.shortLabel}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-zinc-400 leading-tight">
+                              {isDragHover
+                                ? 'Drop here'
+                                : draggingTransitionId
+                                  ? 'Drop FX'
+                                  : boundary.kind === 'intro'
+                                    ? 'Intro seam'
+                                    : boundary.kind === 'outro'
+                                      ? 'Loop seam'
+                                      : `Cut #${cutIdx + 1}`}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Clip Segment Block */}
+                        {segmentAfter && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (videoRef.current) {
+                                videoRef.current.currentTime = segmentAfter.startSec;
+                                setCurrentTime(segmentAfter.startSec);
+                              }
+                            }}
+                            className="flex-1 min-w-[92px] rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 px-2.5 py-2 text-left flex flex-col justify-between cursor-pointer transition-colors"
+                          >
+                            <span className="text-[11px] font-semibold text-zinc-200 truncate">
+                              {segmentAfter.label}
+                            </span>
+                            <span className="text-[10px] font-mono tabular-nums text-zinc-500">
+                              {segmentAfter.startSec.toFixed(1)}s–{segmentAfter.endSec.toFixed(1)}s ({segmentAfter.durationSec}s)
+                            </span>
+                          </button>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Sliders for In-Point and Out-Point */}
@@ -1169,7 +1845,7 @@ if __name__ == "__main__":
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-[11px] font-semibold text-zinc-300">Mark In (Start)</label>
-                    <span className="text-[11px] font-mono text-red-400 font-bold">{inPointSec}s</span>
+                    <span className="text-[11px] font-mono tabular-nums text-red-400 font-bold">{inPointSec}s</span>
                   </div>
                   <input
                     type="range"
@@ -1189,7 +1865,7 @@ if __name__ == "__main__":
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-[11px] font-semibold text-zinc-300">Mark Out (End)</label>
-                    <span className="text-[11px] font-mono text-red-400 font-bold">{outPointSec}s</span>
+                    <span className="text-[11px] font-mono tabular-nums text-red-400 font-bold">{outPointSec}s</span>
                   </div>
                   <input
                     type="range"
