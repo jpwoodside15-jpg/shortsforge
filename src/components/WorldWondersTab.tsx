@@ -16,6 +16,7 @@ import {
   buildQueueItemPipelineState,
   createInitialWeekQueue
 } from './AutomatedDailyPipelineTab';
+import { applyAwinAffiliateMetadata } from '../utils/awinAffiliate';
 import {
   BatchForensicsLogEntry,
   PipelineVerificationResult,
@@ -319,6 +320,13 @@ export const WorldWondersTab: React.FC<WorldWondersTabProps> = ({
       .map((t) => t.trim())
       .filter(Boolean);
 
+    const baseDesc = `${selectedWonder.defaultDescription}\n\nLicense: ${selectedClipLicense}`;
+    const awinMeta = applyAwinAffiliateMetadata({
+      niche: selectedWonder.nicheTag,
+      description: baseDesc,
+      affiliateDisclosure: true
+    });
+
     return {
       id: `queue_${dayInfo.dayOffset + 1}`,
       dayName: dayInfo.dayName,
@@ -343,9 +351,11 @@ export const WorldWondersTab: React.FC<WorldWondersTabProps> = ({
       safeZonesVerified: true,
       brandKitApplied: true,
       tags: parsedTags,
-      description: `${selectedWonder.defaultDescription}\n\nLicense: ${selectedClipLicense}`,
+      description: awinMeta.description,
       videoUrl: currentVideoUrl.trim(),
-      affiliateDisclosure: true,
+      affiliateDisclosure: awinMeta.affiliateDisclosure,
+      affiliateLink: awinMeta.affiliateLink,
+      affiliateMerchant: awinMeta.affiliateMerchant,
       videoId: undefined
     };
   };

@@ -1,27 +1,81 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   TrendingDown, TrendingUp, Scissors, Sparkles, AlertTriangle, 
   CheckCircle2, FileText, Upload, RefreshCw, BarChart2, 
   ArrowRight, Clock, Zap, ShieldAlert, Award, Copy, Check, Play,
-  HelpCircle, Eye, Sliders
+  HelpCircle, Eye, Sliders, Wand2, X
 } from 'lucide-react';
 import { 
   RETENTION_PRESETS, 
   parseYouTubeAnalyticsCsv, 
-  RetentionPreset 
+  RetentionPreset,
+  RetentionDataPoint
 } from '../data/retentionSampleData';
 import { VideoEngagementMap } from './VideoEngagementMap';
+import type { RetentionRepairPayload } from '../utils/retentionRepair';
+
+interface HookOptimizationVariant {
+  id: number;
+  hookType: string;
+  openingWords: string;
+  durationSec: string;
+  stopRateScore: number;
+  curiosityGapType?: string;
+  psychologyReason: string;
+  visualFrame1: string;
+  sfx: string;
+  safeZoneKeyword: string;
+}
+
+interface HookOptimizationResult {
+  topic: string;
+  diagnostic?: {
+    currentIntroFlaw: string;
+    retentionPowerScore: number;
+    curiosityGapScore: number;
+    fixRecommendation: string;
+  };
+  hooks: HookOptimizationVariant[];
+}
+
+function computeFirst5sChurnPct(dataPoints: RetentionDataPoint[]): number {
+  if (dataPoints.length < 2) return 0;
+  const startPoint = dataPoints[0];
+  let pointAt5s = dataPoints[dataPoints.length - 1];
+  for (const pt of dataPoints) {
+    if (pt.second <= 5) {
+      pointAt5s = pt;
+    } else {
+      if (Math.abs(pt.second - 5) < Math.abs(pointAt5s.second - 5)) {
+        pointAt5s = pt;
+      }
+      break;
+    }
+  }
+  return Math.max(0, Math.round((startPoint.retention - pointAt5s.retention) * 10) / 10);
+}
+
+const BENCHMARK_FIRST_5S_CHURN_PCT = (() => {
+  const values = RETENTION_PRESETS.map((preset) => {
+    const parsedPreset = parseYouTubeAnalyticsCsv(preset.csvContent, preset.videoDurationSec);
+    return computeFirst5sChurnPct(parsedPreset.dataPoints);
+  });
+  const avg = values.reduce((sum, v) => sum + v, 0) / Math.max(1, values.length);
+  return Math.round(avg * 10) / 10;
+})();
 
 interface RetentionAnalyzerTabProps {
   onSendToClipper?: (trimStartSec: number, trimEndSec: number, context: string) => void;
   onSendToSimulator?: (hookText: string) => void;
   onSendToThumbnail?: (frameUrl: string, title?: string) => void;
+  onApplyRetentionFix?: (payload: RetentionRepairPayload) => void;
 }
 
 export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
   onSendToClipper,
   onSendToSimulator,
-  onSendToThumbnail
+  onSendToThumbnail,
+  onApplyRetentionFix
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<'curve' | 'engagement-map'>('curve');
   const [selectedPresetId, setSelectedPresetId] = useState<string>('hook-cliff');
@@ -39,10 +93,70 @@ export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
   const [aiReport, setAiReport] = useState<any | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  // First-5s high churn alert & Auto-Optimize Hook state
+  const [dismissedEarlyChurnBanner, setDismissedEarlyChurnBanner] = useState<boolean>(false);
+  const [showEarlyChurnToast, setShowEarlyChurnToast] = useState<boolean>(false);
+  const [isOptimizingHook, setIsOptimizingHook] = useState<boolean>(false);
+  const [hookOptimizationResult, setHookOptimizationResult] = useState<HookOptimizationResult | null>(null);
+  const [hookOptimizeError, setHookOptimizeError] = useState<string | null>(null);
+
   // Parse CSV data reactively
   const parsed = useMemo(() => {
     return parseYouTubeAnalyticsCsv(rawCsv, videoDuration);
   }, [rawCsv, videoDuration]);
+
+  // First-5-second churn rate vs benchmark average
+  const first5sChurnPct = useMemo(
+    () => computeFirst5sChurnPct(parsed.dataPoints),
+    [parsed.dataPoints]
+  );
+  const churnDeltaAboveBenchmark = useMemo(
+    () => Math.round((first5sChurnPct - BENCHMARK_FIRST_5S_CHURN_PCT) * 10) / 10,
+    [first5sChurnPct]
+  );
+  const isHighEarlyChurn =
+    parsed.dataPoints.length >= 2 && first5sChurnPct > BENCHMARK_FIRST_5S_CHURN_PCT;
+
+  // Trigger toast notification & reset banner dismissal whenever a clip with high 5s churn loads
+  useEffect(() => {
+    if (isHighEarlyChurn) {
+      setDismissedEarlyChurnBanner(false);
+      setShowEarlyChurnToast(true);
+      const timer = setTimeout(() => {
+        setShowEarlyChurnToast(false);
+      }, 9000);
+      return () => clearTimeout(timer);
+    } else {
+      setShowEarlyChurnToast(false);
+    }
+  }, [isHighEarlyChurn, selectedPresetId, videoTitle, first5sChurnPct]);
+
+  // Auto-Optimize Hook action (calls /api/hook-optimizer)
+  const handleAutoOptimizeHook = async () => {
+    setIsOptimizingHook(true);
+    setHookOptimizeError(null);
+    setShowEarlyChurnToast(false);
+    try {
+      const res = await fetch('/api/hook-optimizer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topicOrScript: `${videoTitle} (Lost ${first5sChurnPct}% of viewers in the first 5 seconds — rewrite opening 3s hook to stop swipe-away)`,
+          niche
+        })
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as HookOptimizationResult;
+      setHookOptimizationResult(data);
+    } catch (err) {
+      console.error('Auto-Optimize Hook failed:', err);
+      setHookOptimizeError('Could not optimize the opening hook right now. Try again in a moment.');
+    } finally {
+      setIsOptimizingHook(false);
+    }
+  };
 
   // Load a preset
   const handleSelectPreset = (preset: RetentionPreset) => {
@@ -52,6 +166,8 @@ export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
     setVideoDuration(preset.videoDurationSec);
     setNiche(preset.niche);
     setAiReport(null);
+    setHookOptimizationResult(null);
+    setHookOptimizeError(null);
   };
 
   // Handle CSV file upload
@@ -66,6 +182,8 @@ export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
         setSelectedPresetId('custom');
         setVideoTitle(file.name.replace(/\.[^/.]+$/, ''));
         setAiReport(null);
+        setHookOptimizationResult(null);
+        setHookOptimizeError(null);
       }
     };
     reader.readAsText(file);
@@ -268,6 +386,245 @@ export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
         )}
       </div>
 
+      {/* First-5-Second Higher-Than-Average Churn Alert Banner */}
+      {isHighEarlyChurn && !dismissedEarlyChurnBanner && (
+        <div
+          role="alert"
+          className="bg-red-950/35 border border-red-500/40 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4"
+        >
+          <div className="flex items-start gap-3 min-w-0">
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div className="space-y-1 min-w-0">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm font-semibold text-white">
+                <span>Higher-Than-Average First-5s Churn Detected</span>
+                <span aria-hidden="true" className="text-zinc-500">·</span>
+                <span className="font-mono tabular-nums text-red-300">
+                  -{first5sChurnPct}% lost in 0–5s
+                </span>
+                <span aria-hidden="true" className="text-zinc-500">·</span>
+                <span className="font-mono tabular-nums text-xs text-zinc-400">
+                  Benchmark avg: -{BENCHMARK_FIRST_5S_CHURN_PCT}% (+{churnDeltaAboveBenchmark}% above avg)
+                </span>
+              </div>
+              <p className="text-xs text-zinc-300 leading-relaxed">
+                &ldquo;{videoTitle}&rdquo; is losing viewers faster than benchmark before second 5. Rewrite the opening hook and trim slow lead-in frames to stop early swipe-aways.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleAutoOptimizeHook}
+              disabled={isOptimizingHook}
+              className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+            >
+              {isOptimizingHook ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  Optimizing Hook...
+                </>
+              ) : (
+                <>
+                  <Wand2 className="w-3.5 h-3.5" />
+                  Auto-Optimize Hook
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setDismissedEarlyChurnBanner(true)}
+              aria-label="Dismiss early churn alert"
+              className="p-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-white transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Auto-Optimized 0-5s Hook Blueprint Result */}
+      {(hookOptimizationResult || hookOptimizeError) && (
+        <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-800 pb-3">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <Zap className="w-4 h-4 text-amber-400 shrink-0" />
+                <h3 className="text-sm font-bold text-white">
+                  Auto-Optimized 0–5s Hook Blueprint
+                </h3>
+              </div>
+              {hookOptimizationResult?.diagnostic && (
+                <p className="text-xs text-zinc-400">
+                  {hookOptimizationResult.diagnostic.fixRecommendation}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {onSendToClipper && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    onSendToClipper(
+                      0,
+                      3,
+                      `Trim slow 0–3s intro (-${first5sChurnPct}% 5s churn) and apply optimized hook`
+                    )
+                  }
+                  className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-100 rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Scissors className="w-3.5 h-3.5 text-red-400" />
+                  Trim 0–3s Intro in Clipper
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setHookOptimizationResult(null);
+                  setHookOptimizeError(null);
+                }}
+                aria-label="Close hook blueprint"
+                className="p-1.5 rounded-lg bg-zinc-950 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {hookOptimizeError ? (
+            <p className="text-xs text-red-300">{hookOptimizeError}</p>
+          ) : (
+            hookOptimizationResult && (
+              <div className="space-y-4">
+                {hookOptimizationResult.diagnostic && (
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-300 bg-zinc-950 border border-zinc-800 rounded-lg px-3.5 py-2.5">
+                    <span className="text-zinc-400">
+                      Intro Flaw: <strong className="text-zinc-100 font-medium">{hookOptimizationResult.diagnostic.currentIntroFlaw}</strong>
+                    </span>
+                    <span aria-hidden="true" className="text-zinc-600">·</span>
+                    <span className="font-mono tabular-nums text-amber-300">
+                      Retention Power: {hookOptimizationResult.diagnostic.retentionPowerScore}/100
+                    </span>
+                    <span aria-hidden="true" className="text-zinc-600">·</span>
+                    <span className="font-mono tabular-nums text-zinc-300">
+                      Curiosity Gap: {hookOptimizationResult.diagnostic.curiosityGapScore}/100
+                    </span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {(hookOptimizationResult.hooks || []).slice(0, 3).map((hook) => (
+                    <div
+                      key={hook.id}
+                      className="bg-zinc-950 border border-zinc-800 rounded-lg p-4 flex flex-col justify-between gap-3"
+                    >
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-zinc-400">
+                          <span className="truncate text-amber-300 font-semibold">{hook.hookType}</span>
+                          <span className="text-emerald-400 shrink-0">{hook.stopRateScore}% stop</span>
+                        </div>
+                        <p className="text-sm font-semibold text-white leading-snug">
+                          &ldquo;{hook.openingWords}&rdquo;
+                        </p>
+                        <div className="text-[11px] text-zinc-400 space-y-1 pt-1 border-t border-zinc-800/80">
+                          <p>
+                            <span className="text-zinc-500">Frame 1:</span> {hook.visualFrame1}
+                          </p>
+                          <p>
+                            <span className="text-zinc-500">Audio SFX:</span> {hook.sfx}
+                            {hook.safeZoneKeyword ? ` · Highlight "${hook.safeZoneKeyword}"` : ''}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/80">
+                        <button
+                          type="button"
+                          onClick={() => handleCopy(hook.openingWords, `opt_hook_${hook.id}`)}
+                          className="flex-1 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                        >
+                          {copiedKey === `opt_hook_${hook.id}` ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              Copied
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              Copy Hook
+                            </>
+                          )}
+                        </button>
+                        {onSendToSimulator && (
+                          <button
+                            type="button"
+                            onClick={() => onSendToSimulator(hook.openingWords)}
+                            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                          >
+                            <Play className="w-3 h-3" />
+                            Simulate
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      )}
+
+      {/* Floating First-5s Churn Alert Toast Notification */}
+      {showEarlyChurnToast && isHighEarlyChurn && (
+        <div
+          role="status"
+          className="fixed bottom-6 right-6 z-50 max-w-md bg-zinc-950 border border-red-500/50 rounded-xl p-4 shadow-2xl space-y-3"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-white">
+                  High 0–5s Churn Alert ({first5sChurnPct}% vs {BENCHMARK_FIRST_5S_CHURN_PCT}% avg)
+                </div>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Viewers are dropping faster than average in the first 5 seconds of &ldquo;{videoTitle}&rdquo;.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowEarlyChurnToast(false)}
+              aria-label="Close churn toast"
+              className="text-zinc-500 hover:text-zinc-200 cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setShowEarlyChurnToast(false)}
+              className="px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer whitespace-nowrap"
+            >
+              Dismiss
+            </button>
+            <button
+              type="button"
+              onClick={handleAutoOptimizeHook}
+              disabled={isOptimizingHook}
+              className="px-3.5 py-1.5 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+            >
+              <Wand2 className="w-3.5 h-3.5" />
+              Auto-Optimize Hook
+            </button>
+          </div>
+        </div>
+      )}
+
       {activeSubTab === 'engagement-map' ? (
         <VideoEngagementMap
           activeClip={{
@@ -283,6 +640,7 @@ export const RetentionAnalyzerTab: React.FC<RetentionAnalyzerTabProps> = ({
           }}
           onSendToClipper={onSendToClipper}
           onSendToThumbnail={onSendToThumbnail}
+          onApplyRecommendedFix={onApplyRetentionFix}
         />
       ) : (
         <>

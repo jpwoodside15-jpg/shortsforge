@@ -31,6 +31,7 @@ import { SyncToSocialModule } from './components/SyncToSocialModule';
 import { WorldWondersTab, WorldWonderAutoEditPayload } from './components/WorldWondersTab';
 import { ForensicsDashboard } from './components/ForensicsDashboard';
 import { ProStudio } from './components/ProStudio';
+import type { RetentionRepairPayload } from './utils/retentionRepair';
 import { 
   Flame, Scissors, Video, Search, DollarSign, Terminal, 
   CheckCircle2, AlertCircle, ArrowUpRight, Youtube, Github, History, Upload, Globe,
@@ -69,10 +70,16 @@ export default function App() {
     suggestedVoice?: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
   } | undefined>(undefined);
   const [incomingAutoEdit, setIncomingAutoEdit] = useState<WorldWonderAutoEditPayload | null>(null);
+  const [incomingRetentionRepair, setIncomingRetentionRepair] = useState<RetentionRepairPayload | null>(null);
 
   const handleSendWonderToAutoEdit = (payload: WorldWonderAutoEditPayload) => {
     setIncomingAutoEdit(payload);
     setActiveTab('viralvault');
+  };
+
+  const handleApplyRetentionFix = (payload: RetentionRepairPayload) => {
+    setIncomingRetentionRepair(payload);
+    setActiveTab('prostudio');
   };
 
   const handleSendToSimulator = (text: string) => {
@@ -284,6 +291,7 @@ export default function App() {
             onSendToClipper={handleSendToClipper}
             onSendToSimulator={handleSendToSimulator}
             onSendToThumbnail={handleSendToThumbnail}
+            onApplyRetentionFix={handleApplyRetentionFix}
           />
         )}
 
@@ -348,7 +356,10 @@ export default function App() {
         )}
 
         {activeTab === 'prostudio' && (
-          <ProStudio onNavigateTab={(tabId) => setActiveTab(tabId)} />
+          <ProStudio
+            incomingRetentionRepair={incomingRetentionRepair}
+            onNavigateTab={(tabId) => setActiveTab(tabId)}
+          />
         )}
 
         {activeTab === 'transcript' && (

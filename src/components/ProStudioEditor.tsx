@@ -3,7 +3,7 @@ import {
   Play, Pause, RotateCcw, Scissors, Plus, Trash2, Sparkles, Sliders,
   Music, Volume2, ShieldCheck, ShieldAlert, AlertTriangle, Upload, Zap, Film,
   Type, Layers, Wand2, Magnet, CheckCircle2, ArrowRight, Eye, Terminal,
-  Mic, Waves, Gauge
+  Mic, Waves, Gauge, Activity, TrendingDown
 } from 'lucide-react';
 import { playSoundEffect } from '../utils/soundEffects';
 import {
@@ -11,6 +11,7 @@ import {
   buildQueueItemPipelineState,
   createInitialWeekQueue
 } from './AutomatedDailyPipelineTab';
+import { applyAwinAffiliateMetadata } from '../utils/awinAffiliate';
 import {
   BatchForensicsLogEntry,
   PipelineVerificationResult,
@@ -24,6 +25,12 @@ import {
   loadPipelineQueue,
   savePipelineQueue
 } from '../utils/pipelineQueueStore';
+import {
+  RetentionCurvePoint,
+  RetentionRepairPayload,
+  RetentionRepairExecutionResult,
+  runRetentionRepairVerification
+} from '../utils/retentionRepair';
 
 export type ProLutId = 'none' | 'teal_orange' | 'kodak_2383' | 'arctic_aurora' | 'amber_sunset' | 'noir';
 
@@ -140,6 +147,7 @@ export interface ProStudioEditorProps {
   initialTags: string[];
   initialDescription: string;
   initialSubtitleStyle: 'hormozi' | 'cyber' | 'mrbeast' | 'minimal';
+  incomingRetentionRepair?: RetentionRepairPayload | null;
   audioChainConfig?: ProAudioChainState;
   onAudioChainChange?: (next: ProAudioChainState) => void;
   onBeforePublishMaster?: (
@@ -149,6 +157,21 @@ export interface ProStudioEditorProps {
   onToast: (msg: string) => void;
   onNavigateTab?: (tabId: string) => void;
 }
+
+const DEFAULT_HISTORICAL_RETENTION_CURVE: RetentionCurvePoint[] = [
+  { second: 0, retention: 100 },
+  { second: 1, retention: 92 },
+  { second: 2, retention: 76 },
+  { second: 3, retention: 64 },
+  { second: 5, retention: 61 },
+  { second: 8, retention: 59 },
+  { second: 11, retention: 57 },
+  { second: 13, retention: 45 },
+  { second: 15, retention: 42 },
+  { second: 18, retention: 41 },
+  { second: 21, retention: 40 },
+  { second: 24, retention: 43 }
+];
 
 type DragTarget =
   | {
@@ -171,17 +194,26 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
   initialTags,
   initialDescription,
   initialSubtitleStyle,
+  incomingRetentionRepair,
   audioChainConfig,
   onAudioChainChange,
   onBeforePublishMaster,
   onToast,
   onNavigateTab
 }) => {
-  const safeInitialVideo = initialVideoUrl?.trim() || '/samples/sample_blazes.mp4';
+  const safeInitialVideo = initialVideoUrl?.trim() || '/samples/sample_escapes.mp4';
   const [timelineMaxSec] = useState<number>(30);
   const [playheadSec, setPlayheadSec] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [showSafeZones, setShowSafeZones] = useState<boolean>(true);
+  const [showEngagementHeatmap, setShowEngagementHeatmap] = useState<boolean>(true);
+  const [retentionCurve, setRetentionCurve] = useState<RetentionCurvePoint[]>(
+    DEFAULT_HISTORICAL_RETENTION_CURVE
+  );
+  const [activeRepairBanner, setActiveRepairBanner] = useState<{
+    payload: RetentionRepairPayload;
+    execution: RetentionRepairExecutionResult;
+  } | null>(null);
   const [activeInspectorTab, setActiveInspectorTab] = useState<'color' | 'audio' | 'publish'>('color');
 
   // Track 1: Video Segments
@@ -356,6 +388,196 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
     masterGain: GainNode;
     analyser: AnalyserNode;
   } | null>(null);
+
+  const lastHandledRepairNonceRef = useRef<number | null>(null);
+
+  // Pre-load incoming retention repair edit from Video Engagement Map, re-run buildQueueItemPipelineState & verifyBeforeUpload, and log with source "Retention Repair"
+  useEffect(() => {
+    if (!incomingRetentionRepair) return;
+    if (lastHandledRepairNonceRef.current === incomingRetentionRepair.nonce) return;
+    lastHandledRepairNonceRef.current = incomingRetentionRepair.nonce;
+
+    const execution = runRetentionRepairVerification(
+      incomingRetentionRepair,
+      buildQueueItemPipelineState
+    );
+
+    // Pre-load clip metadata & historical retention curve into Pro Studio
+    setPublishTitle(execution.repairedSlot.title);
+    setPublishHookText(execution.appliedHookText);
+    setPublishNiche(execution.repairedSlot.niche);
+    setPublishTagsText(execution.repairedSlot.tags.join(', '));
+    setPublishAffiliateDisclosure(true);
+    setShowEngagementHeatmap(true);
+
+    if (incomingRetentionRepair.retentionCurve && incomingRetentionRepair.retentionCurve.length > 1) {
+      setRetentionCurve(incomingRetentionRepair.retentionCurve);
+    }
+
+    // Apply pre-loaded timeline edit onto video & caption tracks
+    const primaryDuration = Math.max(4, Math.min(20, Math.round(execution.repairedDurationSec * 0.6)));
+    const secondaryDuration = Math.max(4, execution.repairedDurationSec - primaryDuration);
+    setVideoSegments([
+      {
+        id: 'vseg_1',
+        label:
+          incomingRetentionRepair.fixType === 'trim_churn'
+            ? `Trimmed Cut (${incomingRetentionRepair.secondStart}s-${incomingRetentionRepair.secondEnd}s Removed)`
+            : incomingRetentionRepair.fixType === 're_hook'
+              ? 'Re-Hooked Opening (0-3s)'
+              : 'Retained Main Cut',
+        videoUrl: execution.repairedSlot.videoUrl || '/samples/sample_escapes.mp4',
+        startSec: 0,
+        sourceTrimStartSec: execution.trimStartSec,
+        baseDurationSec: primaryDuration,
+        speed: incomingRetentionRepair.fixType === 'trim_churn' ? 1.15 : 1.0,
+        color: { ...DEFAULT_COLOR_GRADE, contrast: 8, saturation: 10 }
+      },
+      {
+        id: 'vseg_2',
+        label: 'Payoff & Loop Cut (B)',
+        videoUrl: '/samples/sample_fun.mp4',
+        startSec: primaryDuration,
+        sourceTrimStartSec: 0,
+        baseDurationSec: secondaryDuration,
+        speed: 1.0,
+        color: { ...DEFAULT_COLOR_GRADE, lut: 'kodak_2383' }
+      }
+    ]);
+    setSelectedVideoSegId('vseg_1');
+
+    setCaptionSegments([
+      {
+        id: 'cseg_1',
+        text: execution.appliedHookText,
+        startSec: 0.1,
+        durationSec: Math.min(4.2, primaryDuration),
+        style: execution.appliedSubtitleStyle
+      },
+      {
+        id: 'cseg_2',
+        text: execution.appliedSubtitleText,
+        startSec: Math.min(4.5, Math.max(2, primaryDuration - 1)),
+        durationSec: Math.min(5.5, secondaryDuration),
+        style: execution.appliedSubtitleStyle
+      }
+    ]);
+    setSelectedCaptionId('cseg_1');
+    setPlayheadSec(Math.min(incomingRetentionRepair.secondStart, execution.repairedDurationSec));
+
+    // Persist repaired slot into shared pipeline queue
+    const currentQueue = loadPipelineQueue<QueuedShort>(createInitialWeekQueue);
+    const existingIdx = currentQueue.findIndex(
+      (q) => q.id === execution.repairedSlot.id || q.dayOffset === execution.repairedSlot.dayOffset
+    );
+    const nextQueue =
+      existingIdx >= 0
+        ? currentQueue.map((q, idx) => (idx === existingIdx ? execution.repairedSlot : q))
+        : [execution.repairedSlot, ...currentQueue];
+    savePipelineQueue(nextQueue);
+
+    setActiveRepairBanner({
+      payload: incomingRetentionRepair,
+      execution
+    });
+    setVerifierGateBanner({
+      verdict: execution.verification.verdict,
+      title: execution.repairedSlot.title,
+      result: execution.verification
+    });
+
+    playSoundEffect(execution.verification.verdict === 'PROCEED' ? 'chime' : 'subdrop', 0.5);
+    onToast(
+      `Retention Repair (${incomingRetentionRepair.fixLabel}) pre-loaded & verified: ${execution.verification.verdict}`
+    );
+  }, [incomingRetentionRepair]);
+
+  // Historical retention dip analysis for Preview Engagement Heatmap overlay
+  const heatmapMetrics = useMemo(() => {
+    const pts =
+      retentionCurve.length >= 2 ? retentionCurve : DEFAULT_HISTORICAL_RETENTION_CURVE;
+    const maxCurveSec = Math.max(10, pts[pts.length - 1]?.second || 24);
+    const cells: Array<{
+      second: number;
+      nextSecond: number;
+      retention: number;
+      nextRetention: number;
+      dropDelta: number;
+      churnVelocity: number;
+    }> = [];
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const cur = pts[i];
+      const next = pts[i + 1];
+      const dt = Math.max(0.5, next.second - cur.second);
+      const dropDelta = Math.round((cur.retention - next.retention) * 10) / 10;
+      const churnVelocity = Math.max(0, Math.round((dropDelta / dt) * 10) / 10);
+      cells.push({
+        second: cur.second,
+        nextSecond: next.second,
+        retention: cur.retention,
+        nextRetention: next.retention,
+        dropDelta,
+        churnVelocity
+      });
+    }
+
+    const dips = cells
+      .filter((c) => c.churnVelocity >= 2.5 || c.dropDelta >= 6)
+      .sort((a, b) => b.dropDelta - a.dropDelta);
+    const worstDip = dips[0] || null;
+
+    // Interpolate retention % at current playhead
+    const mappedSec = Math.min(maxCurveSec, Math.max(0, playheadSec));
+    let currentRetention = pts[0]?.retention ?? 100;
+    for (let i = 0; i < pts.length - 1; i++) {
+      if (mappedSec >= pts[i].second && mappedSec <= pts[i + 1].second) {
+        const span = Math.max(0.001, pts[i + 1].second - pts[i].second);
+        const ratio = (mappedSec - pts[i].second) / span;
+        currentRetention = Math.round(
+          pts[i].retention + (pts[i + 1].retention - pts[i].retention) * ratio
+        );
+        break;
+      }
+      if (mappedSec > pts[pts.length - 1].second) {
+        currentRetention = pts[pts.length - 1].retention;
+      }
+    }
+
+    const isPlayheadInDip = dips.some(
+      (d) => mappedSec >= d.second && mappedSec <= d.nextSecond
+    );
+
+    return { pts, maxCurveSec, cells, dips, worstDip, currentRetention, isPlayheadInDip };
+  }, [retentionCurve, playheadSec]);
+
+  const handleTrimOutHistoricalDip = (dipStart: number, dipEnd: number) => {
+    const dipDur = Math.max(1, Math.round((dipEnd - dipStart) * 10) / 10);
+    setVideoSegments((prev) => {
+      if (prev.length === 0) return prev;
+      const targetIdx = Math.max(
+        0,
+        prev.findIndex((s) => s.id === selectedVideoSegId)
+      );
+      return prev.map((seg, idx) => {
+        if (idx !== targetIdx) return seg;
+        const nextBaseDur = Math.max(3, Math.round((seg.baseDurationSec - dipDur) * 10) / 10);
+        const nextTrimStart =
+          dipStart <= 4
+            ? Math.round((seg.sourceTrimStartSec + dipDur) * 10) / 10
+            : seg.sourceTrimStartSec;
+        return {
+          ...seg,
+          sourceTrimStartSec: nextTrimStart,
+          baseDurationSec: nextBaseDur,
+          label: `${seg.label.split(' [Dip')[0]} [Dip ${dipStart}-${dipEnd}s Cut]`
+        };
+      });
+    });
+    setPlayheadSec(Math.max(0, dipStart));
+    playSoundEffect('whoosh', 0.4);
+    onToast(`Trimmed ${dipDur}s historical retention dip (${dipStart}s–${dipEnd}s) from active segment!`);
+  };
 
   // Sync incoming clip changes from parent ViralVaultTab
   useEffect(() => {
@@ -1176,6 +1398,21 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
 
     const audioTag = `${masterSummary.achievedLufs.toFixed(1)} LUFS (Peak ${masterSummary.peakCeilingDb.toFixed(1)} dBTP)${masterSummary.voiceDeNoiseApplied ? ' | De-Noised VO' : ''}${masterSummary.musicDuckingApplied ? ` | Music Ducked ${masterSummary.duckingAmountDb}dB` : ''}`;
 
+    const targetNiche = publishNiche.trim() || 'Creator & Scenery';
+    const rawDescription = `${initialDescription || publishHookText}\n\nMastered in Pro Studio: 9:16 | ${audioTag} | ${musicTrack.bpm} BPM Beat-Synced`;
+    const awinMeta = publishAffiliateDisclosure
+      ? applyAwinAffiliateMetadata({
+          niche: targetNiche,
+          description: rawDescription,
+          affiliateDisclosure: true
+        })
+      : {
+          description: rawDescription,
+          affiliateLink: undefined,
+          affiliateMerchant: undefined,
+          affiliateDisclosure: false
+        };
+
     const candidateSlot: QueuedShort = {
       id: `queue_${dayInfo.dayOffset + 1}`,
       dayName: dayInfo.dayName,
@@ -1188,7 +1425,7 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
       }),
       title: publishTitle.trim(),
       hookText: publishHookText.trim(),
-      niche: publishNiche.trim() || 'Creator & Scenery',
+      niche: targetNiche,
       durationSec: composedDuration,
       status: 'Ready',
       viewsProjected: '940,000',
@@ -1200,9 +1437,11 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
       safeZonesVerified: showSafeZones,
       brandKitApplied: Boolean(selectedVideoSegment?.color),
       tags: parsedTags,
-      description: `${initialDescription || publishHookText}\n\nMastered in Pro Studio: 9:16 | ${audioTag} | ${musicTrack.bpm} BPM Beat-Synced`,
+      description: awinMeta.description,
       videoUrl: primaryVideoUrl,
-      affiliateDisclosure: publishAffiliateDisclosure,
+      affiliateDisclosure: awinMeta.affiliateDisclosure,
+      affiliateLink: awinMeta.affiliateLink,
+      affiliateMerchant: awinMeta.affiliateMerchant,
       videoId: undefined
     };
 
@@ -1400,25 +1639,83 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
         </div>
       )}
 
+      {/* Incoming Retention Repair Verification Banner */}
+      {activeRepairBanner && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs space-y-1.5 ${
+            activeRepairBanner.execution.verification.verdict === 'PROCEED'
+              ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-100'
+              : 'bg-rose-950/60 border-rose-500/50 text-rose-100'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-bold">
+              <Wand2 className="w-4 h-4 text-red-400 shrink-0" />
+              <span>
+                Retention Repair Pre-Loaded: {activeRepairBanner.payload.fixLabel} (
+                {activeRepairBanner.payload.secondStart}s–{activeRepairBanner.payload.secondEnd}s · -
+                {activeRepairBanner.payload.dropDelta}% churn)
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                  activeRepairBanner.execution.verification.verdict === 'PROCEED'
+                    ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                    : 'bg-rose-500/20 border-rose-500/40 text-rose-300'
+                }`}
+              >
+                {activeRepairBanner.execution.verification.verdict}
+              </span>
+              <button
+                type="button"
+                onClick={() => setActiveRepairBanner(null)}
+                className="text-zinc-400 hover:text-white cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+          <p className="font-mono text-[11px] text-zinc-200 break-all">
+            {activeRepairBanner.execution.forensicsEntry.line}
+          </p>
+        </div>
+      )}
+
       {/* Main Studio Grid: Live 9:16 Composed Monitor (4 cols) + Inspector Panels (8 cols) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
         {/* Left: Live 9:16 Composed Video Preview */}
         <div className="lg:col-span-4 bg-zinc-950 border border-zinc-800 rounded-2xl p-4 flex flex-col items-center space-y-3">
-          <div className="w-full flex items-center justify-between text-xs">
+          <div className="w-full flex items-center justify-between gap-2 text-xs">
             <span className="font-bold text-white flex items-center gap-1.5">
               <Eye className="w-3.5 h-3.5 text-amber-400" />
               Composed 9:16 Monitor
             </span>
-            <button
-              onClick={() => setShowSafeZones(!showSafeZones)}
-              className={`text-[10px] font-mono px-2 py-0.5 rounded border cursor-pointer ${
-                showSafeZones
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                  : 'bg-zinc-900 text-zinc-400 border-zinc-800'
-              }`}
-            >
-              Safe Zones: {showSafeZones ? 'ON' : 'OFF'}
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setShowEngagementHeatmap(!showEngagementHeatmap)}
+                className={`text-[10px] font-mono px-2 py-0.5 rounded border cursor-pointer flex items-center gap-1 ${
+                  showEngagementHeatmap
+                    ? 'bg-red-500/20 text-red-300 border-red-500/40'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                <Activity className="w-3 h-3" />
+                Heatmap: {showEngagementHeatmap ? 'ON' : 'OFF'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSafeZones(!showSafeZones)}
+                className={`text-[10px] font-mono px-2 py-0.5 rounded border cursor-pointer ${
+                  showSafeZones
+                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    : 'bg-zinc-900 text-zinc-400 border-zinc-800'
+                }`}
+              >
+                Safe Zones: {showSafeZones ? 'ON' : 'OFF'}
+              </button>
+            </div>
           </div>
 
           <div className="relative w-full max-w-[260px] aspect-[9/16] bg-black rounded-2xl overflow-hidden border-2 border-zinc-800 shadow-2xl flex items-center justify-center">
@@ -1464,7 +1761,7 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
 
             {/* Active Caption Overlay */}
             {activeCaption && (
-              <div className="absolute top-[48%] inset-x-3 pointer-events-none z-20 text-center flex justify-center">
+              <div className="absolute top-[42%] inset-x-3 pointer-events-none z-20 text-center flex justify-center">
                 <span
                   className={`px-3 py-1.5 rounded-lg text-xs font-black uppercase shadow-2xl ${
                     activeCaption.style === 'hormozi'
@@ -1493,6 +1790,136 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
               )}
             </div>
 
+            {/* Visual Engagement Heatmap Overlay on Preview Window */}
+            {showEngagementHeatmap && (
+              <div className="absolute inset-x-2 bottom-7 z-30 rounded-xl bg-black/80 backdrop-blur-md border border-zinc-700/80 p-2 space-y-1">
+                <div className="flex items-center justify-between text-[9px] font-mono tabular-nums">
+                  <span className="text-zinc-200 font-bold flex items-center gap-1">
+                    <TrendingDown className="w-2.5 h-2.5 text-red-400" />
+                    Engagement Heatmap
+                  </span>
+                  <span
+                    className={`font-bold ${
+                      heatmapMetrics.isPlayheadInDip ? 'text-red-400' : 'text-emerald-400'
+                    }`}
+                  >
+                    {heatmapMetrics.currentRetention}% @ {playheadSec.toFixed(1)}s
+                  </span>
+                </div>
+
+                {/* Click-to-Scrub Retention Curve + Churn Dip Heatmap SVG */}
+                <svg
+                  viewBox="0 0 220 56"
+                  className="w-full h-14 block cursor-crosshair select-none rounded bg-zinc-950/90 border border-zinc-800"
+                  onClick={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+                    const nextSec = Math.round(ratio * heatmapMetrics.maxCurveSec * 10) / 10;
+                    setPlayheadSec(Math.min(totalComposedDurationSec, nextSec));
+                  }}
+                >
+                  {/* Color-coded heatmap bars per second window */}
+                  {heatmapMetrics.cells.map((cell, idx) => {
+                    const x = (cell.second / heatmapMetrics.maxCurveSec) * 220;
+                    const w = Math.max(
+                      2,
+                      ((cell.nextSecond - cell.second) / heatmapMetrics.maxCurveSec) * 220
+                    );
+                    const fill =
+                      cell.churnVelocity >= 5 || cell.dropDelta >= 10
+                        ? 'rgba(220, 38, 38, 0.72)'
+                        : cell.churnVelocity >= 2.5 || cell.dropDelta >= 5
+                          ? 'rgba(217, 119, 6, 0.58)'
+                          : cell.dropDelta < 0
+                            ? 'rgba(16, 185, 129, 0.55)'
+                            : 'rgba(15, 23, 42, 0.65)';
+                    return (
+                      <rect
+                        key={idx}
+                        x={x}
+                        y={2}
+                        width={w}
+                        height={52}
+                        fill={fill}
+                      />
+                    );
+                  })}
+
+                  {/* Trimmed-out visual overlay if active segment sourceTrimStartSec > 0 */}
+                  {selectedVideoSegment && selectedVideoSegment.sourceTrimStartSec > 0 && (
+                    <rect
+                      x={0}
+                      y={2}
+                      width={Math.min(
+                        220,
+                        (selectedVideoSegment.sourceTrimStartSec / heatmapMetrics.maxCurveSec) * 220
+                      )}
+                      height={52}
+                      fill="rgba(9, 9, 11, 0.72)"
+                      stroke="rgba(16, 185, 129, 0.7)"
+                      strokeDasharray="2,2"
+                    />
+                  )}
+
+                  {/* Highlighted historical dip brackets */}
+                  {heatmapMetrics.dips.slice(0, 2).map((dip, idx) => {
+                    const x = (dip.second / heatmapMetrics.maxCurveSec) * 220;
+                    const w = Math.max(
+                      6,
+                      ((dip.nextSecond - dip.second) / heatmapMetrics.maxCurveSec) * 220
+                    );
+                    return (
+                      <rect
+                        key={`dip_${idx}`}
+                        x={x}
+                        y={2}
+                        width={w}
+                        height={52}
+                        fill="none"
+                        stroke="#F87171"
+                        strokeWidth={1.25}
+                        strokeDasharray="3,2"
+                      />
+                    );
+                  })}
+
+                  {/* Historical Retention Curve Polyline */}
+                  <polyline
+                    fill="none"
+                    stroke="#F8FAFC"
+                    strokeWidth={1.75}
+                    points={heatmapMetrics.pts
+                      .map((p) => {
+                        const px = (p.second / heatmapMetrics.maxCurveSec) * 220;
+                        const py = 52 - (Math.min(110, Math.max(0, p.retention)) / 110) * 48;
+                        return `${px.toFixed(1)},${py.toFixed(1)}`;
+                      })
+                      .join(' ')}
+                  />
+
+                  {/* Synchronized Live Playhead Line */}
+                  <line
+                    x1={(Math.min(heatmapMetrics.maxCurveSec, playheadSec) / heatmapMetrics.maxCurveSec) * 220}
+                    x2={(Math.min(heatmapMetrics.maxCurveSec, playheadSec) / heatmapMetrics.maxCurveSec) * 220}
+                    y1={0}
+                    y2={56}
+                    stroke="#38BDF8"
+                    strokeWidth={1.5}
+                  />
+                </svg>
+
+                <div className="flex items-center justify-between text-[8.5px] font-mono text-zinc-400">
+                  <span>0s</span>
+                  <span>
+                    {heatmapMetrics.worstDip
+                      ? `Dip: ${heatmapMetrics.worstDip.second}s–${heatmapMetrics.worstDip.nextSecond}s (-${heatmapMetrics.worstDip.dropDelta}%)`
+                      : 'Stable retention curve'}
+                  </span>
+                  <span>{heatmapMetrics.maxCurveSec}s</span>
+                </div>
+              </div>
+            )}
+
             {showSafeZones && (
               <div className="absolute inset-0 pointer-events-none z-20 border border-dashed border-amber-400/35 flex flex-col justify-between p-1.5">
                 <div className="text-[8px] font-mono text-amber-300/80 text-center bg-black/35 py-0.5">
@@ -1509,6 +1936,85 @@ export const ProStudioEditor: React.FC<ProStudioEditorProps> = ({
             <span>Playhead: {playheadSec.toFixed(2)}s</span>
             <span>Duration: {totalComposedDurationSec}s</span>
           </div>
+
+          {/* Real-Time Dip Trimming Controls paired with Engagement Heatmap */}
+          {showEngagementHeatmap && selectedVideoSegment && (
+            <div className="w-full bg-zinc-900/80 border border-zinc-800 rounded-xl p-2.5 space-y-2 text-[10px] font-mono">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-zinc-300 font-bold flex items-center gap-1">
+                  <Scissors className="w-3 h-3 text-red-400" />
+                  Real-Time Dip Trim
+                </span>
+                {heatmapMetrics.worstDip && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleTrimOutHistoricalDip(
+                        heatmapMetrics.worstDip!.second,
+                        heatmapMetrics.worstDip!.nextSecond
+                      )
+                    }
+                    className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white font-sans font-semibold text-[10px] cursor-pointer"
+                  >
+                    Trim {heatmapMetrics.worstDip.second}–{heatmapMetrics.worstDip.nextSecond}s Dip
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <label className="space-y-1">
+                  <div className="flex justify-between text-zinc-400">
+                    <span>Trim In</span>
+                    <span className="text-zinc-200">{selectedVideoSegment.sourceTrimStartSec.toFixed(1)}s</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={12}
+                    step={0.5}
+                    value={selectedVideoSegment.sourceTrimStartSec}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setVideoSegments((prev) =>
+                        prev.map((s) =>
+                          s.id === selectedVideoSegment.id
+                            ? { ...s, sourceTrimStartSec: val }
+                            : s
+                        )
+                      );
+                      setPlayheadSec(val);
+                    }}
+                    className="w-full accent-red-500 cursor-pointer"
+                  />
+                </label>
+
+                <label className="space-y-1">
+                  <div className="flex justify-between text-zinc-400">
+                    <span>Seg Length</span>
+                    <span className="text-zinc-200">{selectedVideoSegment.baseDurationSec.toFixed(1)}s</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={3}
+                    max={24}
+                    step={0.5}
+                    value={selectedVideoSegment.baseDurationSec}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setVideoSegments((prev) =>
+                        prev.map((s) =>
+                          s.id === selectedVideoSegment.id
+                            ? { ...s, baseDurationSec: val }
+                            : s
+                        )
+                      );
+                    }}
+                    className="w-full accent-emerald-500 cursor-pointer"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
 
           {/* Live WebAudio LUFS Output Meter */}
           <div className="w-full bg-zinc-900/70 border border-zinc-800 rounded-xl p-2 space-y-1">

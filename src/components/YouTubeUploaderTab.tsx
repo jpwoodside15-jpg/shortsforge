@@ -6,7 +6,7 @@ import {
   Calendar, Clock, DollarSign, TrendingUp, RefreshCw, Plus,
   Trash2, MoveUp, MoveDown, CheckSquare, Shield, Tag, Eye,
   Sliders, Zap, Info, Award, Database, Activity,
-  RotateCcw, Music, Volume2, VolumeX, Radio, Tv, Search, AlertCircle, Wand2, Share2, Folder
+  RotateCcw, Music, Volume2, VolumeX, Radio, Tv, Search, AlertCircle, Wand2, Share2, Folder, KeyRound
 } from 'lucide-react';
 import { 
   READY_TO_UPLOAD_CATALOGUE, 
@@ -25,6 +25,7 @@ import {
 } from './UploadTimelineAndAIStudio';
 import { SyncToSocialModule } from './SyncToSocialModule';
 import { BatchUploaderModule } from './BatchUploaderModule';
+import { YouTubeOAuthSettingsPanel } from './YouTubeOAuthSettingsPanel';
 import {
   verifyBeforeUpload,
   PipelineState,
@@ -41,7 +42,7 @@ interface YouTubeUploaderTabProps {
   initialDescription?: string;
   initialTags?: string[];
   initialVideoUrl?: string;
-  initialMode?: 'instant' | 'batch' | 'sequential' | 'timeline' | 'automation' | 'catalogue' | 'compliance' | 'wise_payouts' | 'social_sync';
+  initialMode?: 'instant' | 'batch' | 'sequential' | 'timeline' | 'automation' | 'catalogue' | 'compliance' | 'wise_payouts' | 'social_sync' | 'oauth_settings';
   onNavigateToHealthAudit?: () => void;
   onNavigateToSocialSync?: () => void;
 }
@@ -50,13 +51,13 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
   initialTitle = "The 3-Second Rule That Changed Everything (Shocking Result)",
   initialDescription = "Here is the exact truth about high-retention frameworks.\n\n#shorts #growth #productivity\n\n📌 Free resources in the pinned comment below!",
   initialTags = ["shorts", "growth", "youtubealgorithm"],
-  initialVideoUrl = "/samples/sample_blazes.mp4",
+  initialVideoUrl = "/samples/sample_escapes.mp4",
   initialMode = 'instant',
   onNavigateToHealthAudit,
   onNavigateToSocialSync
 }) => {
   // Navigation Mode
-  const [activeTabMode, setActiveTabMode] = useState<'instant' | 'batch' | 'sequential' | 'timeline' | 'automation' | 'catalogue' | 'compliance' | 'wise_payouts' | 'social_sync'>(initialMode);
+  const [activeTabMode, setActiveTabMode] = useState<'instant' | 'batch' | 'sequential' | 'timeline' | 'automation' | 'catalogue' | 'compliance' | 'wise_payouts' | 'social_sync' | 'oauth_settings'>(initialMode);
 
   // =========================================================================
   // 1. INSTANT 1-CLICK UPLOADER STATE
@@ -70,6 +71,7 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
   const [hasAffiliateDisclosure, setHasAffiliateDisclosure] = useState<boolean>(false);
   const [videoSrc, setVideoSrc] = useState<string>(initialVideoUrl);
   const [fileName, setFileName] = useState<string>('short_viral_render.mp4');
+  const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
 
   // Upload Status & Live Response
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'processing' | 'published'>('idle');
@@ -79,6 +81,12 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
     shortUrl: string;
     studioUrl: string;
     streamingStats?: any;
+    mode?: 'youtube_data_api_v3' | 'simulation_fallback';
+  } | null>(null);
+  const [oauthFallbackNotice, setOauthFallbackNotice] = useState<{
+    code: string;
+    message: string;
+    missingCredentials?: string[];
   } | null>(null);
 
   // Clipboard & Toast
@@ -222,62 +230,124 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
     }
 
     setVerifierBlockedBanner(null);
+    setOauthFallbackNotice(null);
     setUploadStatus('uploading');
     setUploadProgress(15);
     playSoundEffect('whoosh', 0.5);
 
+    const parsedTags = tags.split(',').map((t) => t.trim()).filter(Boolean);
+    const queuedShortMetadata = {
+      id: `instant_${Date.now()}`,
+      title,
+      description,
+      tags: parsedTags,
+      privacyStatus: visibility,
+      categoryId: category,
+      isMadeForKids: isKids,
+      affiliateDisclosure: hasAffiliateDisclosure,
+      videoUrl: videoSrc,
+      verifierGatePassed: true
+    };
+
     try {
-      // Step 1: Simulate stream chunks
-      setTimeout(() => setUploadProgress(45), 500);
-      setTimeout(() => setUploadProgress(82), 1100);
+      setTimeout(() => setUploadProgress(45), 400);
 
-      // Call backend direct upload endpoint
-      const res = await fetch('/api/youtube/direct-upload', {
+      // Step 1: Attempt real YouTube Data API v3 resumable upload (multipart with file + QueuedShort metadata)
+      const formData = new FormData();
+      formData.append('metadata', JSON.stringify(queuedShortMetadata));
+      if (selectedVideoFile) {
+        formData.append('video', selectedVideoFile, selectedVideoFile.name);
+      }
+
+      const realRes = await fetch('/api/youtube/upload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title,
-          description,
-          tags: tags.split(',').map(t => t.trim()),
-          privacyStatus: visibility,
-          categoryId: category,
-          isMadeForKids: isKids,
-          affiliateDisclosure: hasAffiliateDisclosure
-        })
+        body: formData
       });
+      const realData = await realRes.json();
 
-      const data = await res.json();
-
-      setTimeout(() => {
+      if (realRes.ok && realData.success) {
         setUploadProgress(100);
         setUploadStatus('processing');
-      }, 1600);
+        setTimeout(() => {
+          setUploadStatus('published');
+          setPublishedData({
+            videoId: realData.videoId,
+            shortUrl: realData.shortUrl,
+            studioUrl: realData.studioUrl,
+            streamingStats: realData.streamingStats,
+            mode: 'youtube_data_api_v3'
+          });
+          playSoundEffect('chime', 0.6);
+          showToast('Published live via YouTube Data API v3 (resumable upload)!');
+        }, 700);
+        return;
+      }
 
-      setTimeout(() => {
-        setUploadStatus('published');
-        setPublishedData({
-          videoId: data.videoId || 'sh_v7x9k2p',
-          shortUrl: data.shortUrl || `https://youtube.com/shorts/${data.videoId || 'sh_v7x9k2p'}`,
-          studioUrl: data.studioUrl || `https://studio.youtube.com/video/${data.videoId || 'sh_v7x9k2p'}/edit`,
-          streamingStats: data.streamingStats
+      // Step 2: Cleanly surface missing OAuth .env error and fall back to existing simulation
+      if (realData.code === 'MISSING_YOUTUBE_OAUTH_CREDENTIALS' || realData.fallbackSimulationAvailable) {
+        setOauthFallbackNotice({
+          code: realData.code || 'MISSING_YOUTUBE_OAUTH_CREDENTIALS',
+          message:
+            realData.error ||
+            'YouTube OAuth credentials are not configured in .env. Running simulation fallback.',
+          missingCredentials: realData.missingCredentials
         });
-        playSoundEffect('chime', 0.6);
-        showToast('Successfully published Short to YouTube Data API!');
-      }, 2300);
 
-    } catch (err) {
+        setUploadProgress(78);
+        const simRes = await fetch('/api/youtube/direct-upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title,
+            description,
+            tags: parsedTags,
+            privacyStatus: visibility,
+            categoryId: category,
+            isMadeForKids: isKids,
+            affiliateDisclosure: hasAffiliateDisclosure
+          })
+        });
+        const simData = await simRes.json();
+
+        setTimeout(() => {
+          setUploadProgress(100);
+          setUploadStatus('processing');
+        }, 500);
+
+        setTimeout(() => {
+          setUploadStatus('published');
+          setPublishedData({
+            videoId: simData.videoId || 'sh_v7x9k2p',
+            shortUrl: simData.shortUrl || `https://youtube.com/shorts/${simData.videoId || 'sh_v7x9k2p'}`,
+            studioUrl: simData.studioUrl || `https://studio.youtube.com/video/${simData.videoId || 'sh_v7x9k2p'}/edit`,
+            streamingStats: simData.streamingStats,
+            mode: 'simulation_fallback'
+          });
+          playSoundEffect('chime', 0.5);
+          showToast('YouTube OAuth credentials missing in .env — completed via simulation fallback.');
+        }, 1200);
+        return;
+      }
+
+      throw new Error(realData.error || 'YouTube upload failed');
+    } catch (err: any) {
       console.error('Instant upload error:', err);
-      // Fallback completion
+      setOauthFallbackNotice({
+        code: 'UPLOAD_FALLBACK_TRIGGERED',
+        message: err?.message || 'Unable to reach YouTube Data API v3; completed with simulation fallback.'
+      });
       setTimeout(() => {
         const fallbackId = 'sh_' + Math.random().toString(36).substring(2, 9);
+        setUploadProgress(100);
         setUploadStatus('published');
         setPublishedData({
           videoId: fallbackId,
           shortUrl: `https://youtube.com/shorts/${fallbackId}`,
-          studioUrl: `https://studio.youtube.com/video/${fallbackId}/edit`
+          studioUrl: `https://studio.youtube.com/video/${fallbackId}/edit`,
+          mode: 'simulation_fallback'
         });
-        playSoundEffect('chime', 0.6);
-      }, 2000);
+        playSoundEffect('chime', 0.5);
+      }, 900);
     }
   };
 
@@ -850,6 +920,18 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
               </span>
             </button>
 
+            <button
+              onClick={() => { setActiveTabMode('oauth_settings'); playSoundEffect('pulse', 0.3); }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                activeTabMode === 'oauth_settings'
+                  ? 'bg-zinc-800 text-white shadow border border-red-500/40'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              <KeyRound className="w-3.5 h-3.5 text-red-400" />
+              <span>OAuth Settings (.env)</span>
+            </button>
+
             {onNavigateToHealthAudit && (
               <button
                 onClick={onNavigateToHealthAudit}
@@ -883,6 +965,44 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
             {verifierBlockedBanner.result.repairAction && (
               <p className="text-[11px] font-bold text-amber-300">
                 VERDICT: REPAIR via {verifierBlockedBanner.result.repairAction}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* YouTube OAuth Missing Credentials / Fallback Notice */}
+        {oauthFallbackNotice && (
+          <div className="mt-4 p-4 bg-amber-950/50 border border-amber-500/40 rounded-xl text-xs text-amber-200 space-y-2 animate-fadeIn">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 font-bold text-amber-300">
+                <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>YouTube Data API v3 Fallback ({oauthFallbackNotice.code})</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setActiveTabMode('oauth_settings')}
+                  className="text-amber-300 hover:text-white underline font-semibold cursor-pointer"
+                >
+                  Open OAuth Settings (.env)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOauthFallbackNotice(null)}
+                  className="text-zinc-400 hover:text-white cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+            <p className="font-mono text-[11px] text-amber-100/90">{oauthFallbackNotice.message}</p>
+            {oauthFallbackNotice.missingCredentials && oauthFallbackNotice.missingCredentials.length > 0 && (
+              <p className="text-[11px] text-zinc-300">
+                Missing in <code className="font-mono text-amber-200">.env</code>:{' '}
+                <code className="font-mono text-white">
+                  {oauthFallbackNotice.missingCredentials.join(', ')}
+                </code>
+                . Existing simulation fallback was used so your workflow stayed unblocked.
               </p>
             )}
           </div>
@@ -933,6 +1053,7 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     if (f) {
+                      setSelectedVideoFile(f);
                       setFileName(f.name);
                       setVideoSrc(URL.createObjectURL(f));
                       setTitle(f.name.replace(/\.[^/.]+$/, '').slice(0, 55));
@@ -1138,13 +1259,23 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
             {/* Live Success Banner */}
             {publishedData && uploadStatus === 'published' && (
               <div className="bg-emerald-950/40 border border-emerald-500/40 p-4 rounded-xl space-y-3 animate-fadeIn">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-2 text-emerald-300 font-bold text-xs">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    Live on YouTube Shorts! Video ID: {publishedData.videoId}
+                    {publishedData.mode === 'youtube_data_api_v3'
+                      ? `Live on YouTube Data API v3 (Resumable)! Video ID: ${publishedData.videoId}`
+                      : `Simulated Upload Fallback Complete — Video ID: ${publishedData.videoId}`}
                   </div>
-                  <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 font-bold">
-                    Monetization: Green Dollar
+                  <span
+                    className={`text-[10px] font-mono px-2 py-0.5 rounded border font-bold ${
+                      publishedData.mode === 'youtube_data_api_v3'
+                        ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                        : 'text-amber-300 bg-amber-500/10 border-amber-500/30'
+                    }`}
+                  >
+                    {publishedData.mode === 'youtube_data_api_v3'
+                      ? 'YouTube Data API v3'
+                      : 'Simulation Fallback'}
                   </span>
                 </div>
 
@@ -1860,6 +1991,11 @@ export const YouTubeUploaderTab: React.FC<YouTubeUploaderTabProps> = ({
           }}
         />
       )}
+
+      {/* ========================================================================= */}
+      {/* MODE 8: YOUTUBE OAUTH SETTINGS (.env)                                     */}
+      {/* ========================================================================= */}
+      {activeTabMode === 'oauth_settings' && <YouTubeOAuthSettingsPanel />}
 
       {/* Shared Batch Forensics Log outside Batch mode */}
       {activeTabMode !== 'batch' && forensicsLog.length > 0 && (

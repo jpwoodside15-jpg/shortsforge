@@ -249,7 +249,8 @@ export interface BatchForensicsLogEntry {
     | 'Sequential Pipeline'
     | 'Automated Daily Pipeline'
     | 'World Wonders'
-    | 'Pro Studio';
+    | 'Pro Studio'
+    | 'Retention Repair';
   targetTitle: string;
   proposedAction: PipelineStep;
   verdict: 'PROCEED' | 'BLOCKED';

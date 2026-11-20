@@ -35,6 +35,7 @@ import {
   writeToBatchForensicsLog
 } from '../utils/pipelineVerifier';
 import { loadPipelineQueue, savePipelineQueue } from '../utils/pipelineQueueStore';
+import type { RetentionRepairPayload } from '../utils/retentionRepair';
 
 export type { ProAudioChainState, ProAudioMasteringSummary };
 
@@ -175,6 +176,7 @@ export interface ProStudioProps {
   initialTags?: string[];
   initialDescription?: string;
   initialSubtitleStyle?: 'hormozi' | 'cyber' | 'mrbeast' | 'minimal';
+  incomingRetentionRepair?: RetentionRepairPayload | null;
   onToast?: (msg: string) => void;
   onNavigateTab?: (tabId: string) => void;
 }
@@ -182,12 +184,13 @@ export interface ProStudioProps {
 export const ProStudio: React.FC<ProStudioProps> = ({
   initialTitle = 'Pro Studio 9:16 Master Short',
   initialHookText = 'WATCH THIS BEFORE IT GETS PATCHED',
-  initialNiche = 'Tech & Creator Studio',
-  initialVideoUrl = '/samples/sample_blazes.mp4',
+  initialNiche = 'Tech & AI',
+  initialVideoUrl = '/samples/sample_escapes.mp4',
   initialDurationSec = 24,
   initialTags = ['shorts', 'prostudio', 'viral', 'audio'],
   initialDescription = 'Edited with Pro Studio multi-track timeline, beat-synced cutting, Film Grade LUTs, and -14 LUFS WebAudio mastering.',
   initialSubtitleStyle = 'hormozi',
+  incomingRetentionRepair = null,
   onToast,
   onNavigateTab
 }) => {
@@ -205,7 +208,7 @@ export const ProStudio: React.FC<ProStudioProps> = ({
     getBatchForensicsLog()
   );
   const [forensicsFilter, setForensicsFilter] = useState<
-    'ALL' | 'PRO_STUDIO' | 'PROCEED' | 'BLOCKED'
+    'ALL' | 'PRO_STUDIO' | 'RETENTION_REPAIR' | 'PROCEED' | 'BLOCKED'
   >('ALL');
   const [batchVerifySummary, setBatchVerifySummary] = useState<{
     total: number;
@@ -254,6 +257,7 @@ export const ProStudio: React.FC<ProStudioProps> = ({
   const filteredForensics = useMemo(() => {
     return forensicsLog.filter((entry) => {
       if (forensicsFilter === 'PRO_STUDIO' && entry.source !== 'Pro Studio') return false;
+      if (forensicsFilter === 'RETENTION_REPAIR' && entry.source !== 'Retention Repair') return false;
       if (forensicsFilter === 'PROCEED' && entry.verdict !== 'PROCEED') return false;
       if (forensicsFilter === 'BLOCKED' && entry.verdict !== 'BLOCKED') return false;
       return true;
@@ -529,6 +533,7 @@ export const ProStudio: React.FC<ProStudioProps> = ({
         initialTags={initialTags}
         initialDescription={initialDescription}
         initialSubtitleStyle={initialSubtitleStyle}
+        incomingRetentionRepair={incomingRetentionRepair}
         audioChainConfig={audioChain}
         onAudioChainChange={setAudioChain}
         onBeforePublishMaster={handleBeforePublishMaster}
@@ -609,6 +614,7 @@ export const ProStudio: React.FC<ProStudioProps> = ({
             {[
               { id: 'ALL', label: 'All Events' },
               { id: 'PRO_STUDIO', label: 'Pro Studio Only' },
+              { id: 'RETENTION_REPAIR', label: 'Retention Repair' },
               { id: 'PROCEED', label: 'PROCEED' },
               { id: 'BLOCKED', label: 'BLOCKED' }
             ].map((f) => (

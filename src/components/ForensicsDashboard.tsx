@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   ShieldCheck, ShieldAlert, Download, ArrowUpDown, ArrowUp, ArrowDown,
-  Trash2, RefreshCw, Sparkles, Filter, FileText
+  Trash2, RefreshCw, Sparkles, Filter, FileText, Calendar, Upload, Wrench, AlertOctagon
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import {
@@ -11,8 +11,110 @@ import {
   subscribeBatchForensicsLog,
   clearBatchForensicsLog
 } from '../utils/pipelineVerifier';
+import { PIPELINE_QUEUE_STORAGE_KEY } from '../utils/pipelineQueueStore';
 
 const FORENSICS_STORAGE_KEY = 'shortsforge_batch_forensics_log_v1';
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface WeeklyForensicsDigest {
+  windowStartIso: string;
+  windowEndIso: string;
+  totalAudited7d: number;
+  totalUploads7d: number;
+  totalBlocks7d: number;
+  blocksByPrecondition: Array<{ precondition: string; count: number }>;
+  mostCommonRepairAction: { action: PipelineStep | null; count: number };
+  quarantinedCount: number;
+  quarantinedQueueSlots: number;
+  uniqueBlockedTargets7d: number;
+}
+
+function readQuarantinedQueueSlotCount(): number {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem(PIPELINE_QUEUE_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((item: any) => item?.status === 'Quarantined').length;
+        }
+      }
+    }
+  } catch {
+    // Ignore storage parse errors
+  }
+  return 0;
+}
+
+export function computeWeeklyForensicsDigest(
+  entries: BatchForensicsLogEntry[],
+  nowMs: number = Date.now(),
+  quarantinedQueueSlots: number = readQuarantinedQueueSlotCount()
+): WeeklyForensicsDigest {
+  const cutoffMs = nowMs - SEVEN_DAYS_MS;
+  const recentEntries = entries.filter((entry) => {
+    const ts = new Date(entry.timestamp).getTime();
+    return Number.isFinite(ts) && ts >= cutoffMs && ts <= nowMs + 60_000;
+  });
+
+  const totalUploads7d = recentEntries.filter(
+    (e) => e.verdict === 'PROCEED' && e.proposedAction === 'UPLOAD'
+  ).length;
+
+  const blocked7d = recentEntries.filter((e) => e.verdict === 'BLOCKED');
+
+  const preconditionCounts = new Map<string, number>();
+  const repairCounts = new Map<PipelineStep, number>();
+  const blockedTargets = new Set<string>();
+
+  for (const entry of blocked7d) {
+    if (entry.targetTitle) {
+      blockedTargets.add(entry.targetTitle);
+    }
+    const failedList =
+      entry.failedPreconditions && entry.failedPreconditions.length > 0
+        ? entry.failedPreconditions
+        : ['unspecified_precondition'];
+    for (const field of failedList) {
+      preconditionCounts.set(field, (preconditionCounts.get(field) || 0) + 1);
+    }
+    if (entry.repairAction) {
+      repairCounts.set(entry.repairAction, (repairCounts.get(entry.repairAction) || 0) + 1);
+    }
+  }
+
+  const blocksByPrecondition = Array.from(preconditionCounts.entries())
+    .map(([precondition, count]) => ({ precondition, count }))
+    .sort((a, b) => b.count - a.count || a.precondition.localeCompare(b.precondition));
+
+  let topRepairAction: PipelineStep | null = null;
+  let topRepairCount = 0;
+  repairCounts.forEach((count, action) => {
+    if (count > topRepairCount) {
+      topRepairAction = action;
+      topRepairCount = count;
+    }
+  });
+
+  const uniqueBlockedTargets7d = blockedTargets.size;
+  const quarantinedCount = Math.max(quarantinedQueueSlots, uniqueBlockedTargets7d);
+
+  return {
+    windowStartIso: new Date(cutoffMs).toISOString(),
+    windowEndIso: new Date(nowMs).toISOString(),
+    totalAudited7d: recentEntries.length,
+    totalUploads7d,
+    totalBlocks7d: blocked7d.length,
+    blocksByPrecondition,
+    mostCommonRepairAction: {
+      action: topRepairAction,
+      count: topRepairCount
+    },
+    quarantinedCount,
+    quarantinedQueueSlots,
+    uniqueBlockedTargets7d
+  };
+}
 
 export type ForensicsSortField = 'timestamp' | 'proposedAction' | 'verdict' | 'details';
 export type ForensicsSortDirection = 'asc' | 'desc';
@@ -104,6 +206,9 @@ export const ForensicsDashboard: React.FC = () => {
   const [entries, setEntries] = useState<BatchForensicsLogEntry[]>(() =>
     readLogsFromLocalStorage()
   );
+  const [quarantinedQueueSlots, setQuarantinedQueueSlots] = useState<number>(() =>
+    readQuarantinedQueueSlotCount()
+  );
   const [sortField, setSortField] = useState<ForensicsSortField>('timestamp');
   const [sortDirection, setSortDirection] = useState<ForensicsSortDirection>('desc');
   const [verdictFilter, setVerdictFilter] = useState<'ALL' | 'PROCEED' | 'BLOCKED'>('ALL');
@@ -111,6 +216,7 @@ export const ForensicsDashboard: React.FC = () => {
 
   const refreshFromStorage = () => {
     setEntries(readLogsFromLocalStorage());
+    setQuarantinedQueueSlots(readQuarantinedQueueSlotCount());
   };
 
   useEffect(() => {
@@ -119,7 +225,7 @@ export const ForensicsDashboard: React.FC = () => {
     });
 
     const handleStorage = (e: StorageEvent) => {
-      if (e.key === FORENSICS_STORAGE_KEY) {
+      if (e.key === FORENSICS_STORAGE_KEY || e.key === PIPELINE_QUEUE_STORAGE_KEY) {
         refreshFromStorage();
       }
     };
@@ -137,6 +243,7 @@ export const ForensicsDashboard: React.FC = () => {
             return parsed;
           });
         }
+        setQuarantinedQueueSlots(readQuarantinedQueueSlotCount());
       } catch {
         // Ignore poll parse errors
       }
@@ -204,7 +311,32 @@ export const ForensicsDashboard: React.FC = () => {
     });
   }, [entries, sortField, sortDirection, verdictFilter, stepFilter]);
 
+  const weeklyDigest = useMemo(
+    () => computeWeeklyForensicsDigest(entries, Date.now(), quarantinedQueueSlots),
+    [entries, quarantinedQueueSlots]
+  );
+
   const handleExportCsv = () => {
+    const digestRows = [
+      ['WEEKLY FORENSICS DIGEST (LAST 7 DAYS)', `${new Date(weeklyDigest.windowStartIso).toLocaleDateString()} - ${new Date(weeklyDigest.windowEndIso).toLocaleDateString()}`],
+      ['Total Uploads (7d PROCEED)', String(weeklyDigest.totalUploads7d)],
+      ['Total Audited Events (7d)', String(weeklyDigest.totalAudited7d)],
+      ['Total Blocked Events (7d)', String(weeklyDigest.totalBlocks7d)],
+      [
+        'Most Common Repair Action (7d)',
+        weeklyDigest.mostCommonRepairAction.action
+          ? `${weeklyDigest.mostCommonRepairAction.action} (${weeklyDigest.mostCommonRepairAction.count})`
+          : 'NONE (0)'
+      ],
+      ['Quarantined Count', String(weeklyDigest.quarantinedCount)],
+      [
+        'Blocks Grouped by Failed Precondition (7d)',
+        weeklyDigest.blocksByPrecondition.length > 0
+          ? weeklyDigest.blocksByPrecondition.map((b) => `${b.precondition}: ${b.count}`).join(' | ')
+          : 'None'
+      ]
+    ].map((r) => r.map(escapeCsvCell).join(','));
+
     const headers = ['Timestamp', 'Step', 'Status (Verdict)', 'Source', 'Target', 'Repair Action', 'Details'];
     const rows = filteredAndSorted.map((entry) => [
       escapeCsvCell(entry.timestamp),
@@ -216,7 +348,12 @@ export const ForensicsDashboard: React.FC = () => {
       escapeCsvCell(buildDetailsText(entry))
     ]);
 
-    const csvContent = [headers.map(escapeCsvCell).join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const csvContent = [
+      ...digestRows,
+      '',
+      headers.map(escapeCsvCell).join(','),
+      ...rows.map((r) => r.join(','))
+    ].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -277,34 +414,96 @@ export const ForensicsDashboard: React.FC = () => {
       18
     );
 
-    // Executive Summary Cards
-    let y = 32;
+    // Weekly Forensics Digest (Last 7 Days) Executive Section
+    let y = 31;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.setTextColor(30, 41, 59);
+    doc.text(
+      sanitizePdfText(
+        `WEEKLY FORENSICS DIGEST (LAST 7 DAYS: ${new Date(weeklyDigest.windowStartIso).toLocaleDateString()} - ${new Date(weeklyDigest.windowEndIso).toLocaleDateString()})`
+      ),
+      margin,
+      y
+    );
+    y += 3;
+
     const cardGap = 4;
     const cardWidth = (contentWidth - cardGap * 3) / 4;
-    const summaryCards = [
-      { label: 'TOTAL AUDITED', value: String(totalCount), rgb: [30, 41, 59] as const },
-      { label: 'SUCCEEDED (PROCEED)', value: String(successCount), rgb: [6, 95, 70] as const },
-      { label: 'BLOCKED (FAILURES)', value: String(failureCount), rgb: [159, 18, 57] as const },
-      { label: 'COMPLIANCE PASS RATE', value: `${passRate}%`, rgb: [67, 56, 202] as const }
+    const topRepairLabel = weeklyDigest.mostCommonRepairAction.action
+      ? `${weeklyDigest.mostCommonRepairAction.action} (${weeklyDigest.mostCommonRepairAction.count})`
+      : 'NONE';
+
+    const digestCards = [
+      {
+        label: 'TOTAL UPLOADS (7D)',
+        value: String(weeklyDigest.totalUploads7d),
+        sub: `${passRate}% pass (${successCount}/${totalCount} shown)`,
+        rgb: [6, 95, 70] as const
+      },
+      {
+        label: 'BLOCKS (7D)',
+        value: String(weeklyDigest.totalBlocks7d),
+        sub: `${weeklyDigest.blocksByPrecondition.length} precondition type(s)`,
+        rgb: [159, 18, 57] as const
+      },
+      {
+        label: 'MOST COMMON REPAIR',
+        value: topRepairLabel,
+        sub: 'Primary remediation step',
+        rgb: [67, 56, 202] as const
+      },
+      {
+        label: 'QUARANTINED COUNT',
+        value: String(weeklyDigest.quarantinedCount),
+        sub: `${weeklyDigest.quarantinedQueueSlots} active queue slot(s)`,
+        rgb: [180, 83, 9] as const
+      }
     ];
 
-    summaryCards.forEach((card, idx) => {
+    digestCards.forEach((card, idx) => {
       const cx = margin + idx * (cardWidth + cardGap);
       doc.setFillColor(248, 250, 252);
       doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(cx, y, cardWidth, 16, 2, 2, 'FD');
+      doc.roundedRect(cx, y, cardWidth, 18, 2, 2, 'FD');
 
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(7.5);
+      doc.setFontSize(7.2);
       doc.setTextColor(100, 116, 139);
-      doc.text(card.label, cx + 3.5, y + 5.5);
+      doc.text(card.label, cx + 3.5, y + 5);
 
-      doc.setFontSize(13);
+      doc.setFontSize(11.5);
       doc.setTextColor(card.rgb[0], card.rgb[1], card.rgb[2]);
-      doc.text(card.value, cx + 3.5, y + 12.5);
+      doc.text(sanitizePdfText(card.value), cx + 3.5, y + 11.5);
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(sanitizePdfText(card.sub), cx + 3.5, y + 15.8);
     });
 
     y += 22;
+
+    // Blocks grouped by failed precondition summary bar
+    const preconditionSummary =
+      weeklyDigest.blocksByPrecondition.length > 0
+        ? weeklyDigest.blocksByPrecondition
+            .map((item) => `${item.precondition}: ${item.count}`)
+            .join('   |   ')
+        : 'No failed preconditions recorded in the last 7 days.';
+
+    doc.setFillColor(241, 245, 249);
+    doc.setDrawColor(203, 213, 225);
+    doc.roundedRect(margin, y, contentWidth, 9, 1.5, 1.5, 'FD');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    doc.setTextColor(51, 65, 85);
+    doc.text('7D BLOCKS BY PRECONDITION:', margin + 3, y + 5.7);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(15, 23, 42);
+    doc.text(sanitizePdfText(preconditionSummary).slice(0, 145), margin + 48, y + 5.7);
+
+    y += 13;
 
     // Table Columns
     const colWidths = {
@@ -501,6 +700,101 @@ export const ForensicsDashboard: React.FC = () => {
             <FileText className="w-3.5 h-3.5" />
             Export to PDF
           </button>
+        </div>
+      </div>
+
+      {/* Weekly Forensics Digest (Last 7 Days) */}
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-3.5 h-3.5 text-indigo-400" />
+            <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-300 font-mono">
+              Weekly Forensics Digest · Last 7 Days
+            </h4>
+          </div>
+          <span className="text-[11px] font-mono text-zinc-500 tabular-nums">
+            {new Date(weeklyDigest.windowStartIso).toLocaleDateString()} – {new Date(weeklyDigest.windowEndIso).toLocaleDateString()} · {weeklyDigest.totalAudited7d} verified events
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* Card 1: Total Uploads (7d) */}
+          <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+              <span>Total Uploads (7d)</span>
+              <Upload className="w-3.5 h-3.5 text-emerald-400" />
+            </div>
+            <div className="text-2xl font-black text-emerald-400 font-mono tabular-nums">
+              {weeklyDigest.totalUploads7d}
+            </div>
+            <div className="text-[11px] text-zinc-500 font-mono">
+              UPLOAD verdicts cleared (PROCEED)
+            </div>
+          </div>
+
+          {/* Card 2: Blocks Grouped by Failed Precondition */}
+          <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3.5 space-y-2">
+            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+              <span>Blocks by Precondition</span>
+              <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+            </div>
+            {weeklyDigest.blocksByPrecondition.length === 0 ? (
+              <div className="space-y-1">
+                <div className="text-2xl font-black text-zinc-200 font-mono tabular-nums">0</div>
+                <div className="text-[11px] text-emerald-400/90 font-mono">No failed preconditions</div>
+              </div>
+            ) : (
+              <div className="space-y-1.5 max-h-24 overflow-y-auto pr-1">
+                {weeklyDigest.blocksByPrecondition.slice(0, 4).map((item) => {
+                  const pct = Math.max(
+                    12,
+                    Math.round((item.count / Math.max(1, weeklyDigest.totalBlocks7d)) * 100)
+                  );
+                  return (
+                    <div key={item.precondition} className="space-y-0.5">
+                      <div className="flex items-center justify-between text-[10px] font-mono">
+                        <span className="text-zinc-200 truncate pr-2">{item.precondition}</span>
+                        <span className="text-rose-400 font-bold tabular-nums">{item.count}</span>
+                      </div>
+                      <div className="h-1 w-full bg-zinc-950 rounded-full overflow-hidden">
+                        <div className="h-full bg-rose-500/80" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Card 3: Most Common Repair Action */}
+          <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+              <span>Most Common Repair</span>
+              <Wrench className="w-3.5 h-3.5 text-indigo-400" />
+            </div>
+            <div className="text-xl font-black text-indigo-300 font-mono truncate">
+              {weeklyDigest.mostCommonRepairAction.action || 'NONE'}
+            </div>
+            <div className="text-[11px] text-zinc-500 font-mono tabular-nums">
+              {weeklyDigest.mostCommonRepairAction.action
+                ? `Triggered ${weeklyDigest.mostCommonRepairAction.count} time(s) in 7d`
+                : 'No repairs needed in last 7d'}
+            </div>
+          </div>
+
+          {/* Card 4: Quarantined Count */}
+          <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3.5 space-y-1.5">
+            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+              <span>Quarantined Count</span>
+              <AlertOctagon className="w-3.5 h-3.5 text-amber-400" />
+            </div>
+            <div className="text-2xl font-black text-amber-400 font-mono tabular-nums">
+              {weeklyDigest.quarantinedCount}
+            </div>
+            <div className="text-[11px] text-zinc-500 font-mono tabular-nums">
+              {weeklyDigest.quarantinedQueueSlots} queue slot(s) · {weeklyDigest.uniqueBlockedTargets7d} blocked clip(s)
+            </div>
+          </div>
         </div>
       </div>
 

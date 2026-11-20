@@ -2,17 +2,18 @@ import React, { useState } from 'react';
 import { 
   Sparkles, Copy, Check, ExternalLink, Flame, MessageSquare, 
   Hash, FileText, Smartphone, ArrowRight, Zap, Target, BookmarkCheck,
-  AlertTriangle, HelpCircle, Eye, RefreshCw, Layers, Brain
+  AlertTriangle, HelpCircle, Eye, RefreshCw, Layers, Brain, ListChecks
 } from 'lucide-react';
 import { CopywriterResult } from '../types';
 import { PsychologicalTriggerEngine } from './PsychologicalTriggerEngine';
+import { BulkTitleOptimizer } from './BulkTitleOptimizer';
 
 interface CopywriterTabProps {
   onSendToSimulator?: (title: string) => void;
 }
 
 export const CopywriterTab: React.FC<CopywriterTabProps> = ({ onSendToSimulator }) => {
-  const [activeSubTab, setActiveSubTab] = useState<'psychological_engine' | 'ctr_copywriter'>('psychological_engine');
+  const [activeSubTab, setActiveSubTab] = useState<'psychological_engine' | 'ctr_copywriter' | 'bulk_title_optimizer'>('psychological_engine');
   const [topic, setTopic] = useState('Why 99% of people stay poor (and how to fix it)');
   const [scriptIntro, setScriptIntro] = useState('Hey guys! In this video today I wanted to talk about why most people fail in business and stay broke...');
   const [affiliateLink, setAffiliateLink] = useState('https://notion.so/join/freeproductivity');
@@ -167,7 +168,7 @@ export const CopywriterTab: React.FC<CopywriterTabProps> = ({ onSendToSimulator 
           <button
             type="button"
             onClick={() => setActiveSubTab('ctr_copywriter')}
-            className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 transition-all cursor-pointer ${
+            className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 transition-all whitespace-nowrap shrink-0 cursor-pointer ${
               activeSubTab === 'ctr_copywriter'
                 ? 'bg-zinc-800 text-white border border-zinc-700 shadow-md'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
@@ -176,11 +177,29 @@ export const CopywriterTab: React.FC<CopywriterTabProps> = ({ onSendToSimulator 
             <Flame className="w-4 h-4 text-red-500" />
             <span>Mobile CTR Titles &amp; SEO Package</span>
           </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveSubTab('bulk_title_optimizer')}
+            className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              activeSubTab === 'bulk_title_optimizer'
+                ? 'bg-emerald-600 text-white shadow-md'
+                : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
+            }`}
+          >
+            <ListChecks className="w-4 h-4" />
+            <span>Bulk Title Optimizer</span>
+          </button>
         </div>
 
         <div className="text-xs text-zinc-400 font-mono hidden sm:flex items-center gap-2 pr-2">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span>{activeSubTab === 'psychological_engine' ? 'Curiosity Gaps & Pacing Accelerants' : 'Mobile Limits & Conversion Comments'}</span>
+          <span>
+            {activeSubTab === 'psychological_engine'
+              ? 'Curiosity Gaps & Pacing Accelerants'
+              : activeSubTab === 'bulk_title_optimizer'
+                ? 'Batch Transcripts & Queue Metadata Sync'
+                : 'Mobile Limits & Conversion Comments'}
+          </span>
         </div>
       </div>
 
@@ -190,6 +209,11 @@ export const CopywriterTab: React.FC<CopywriterTabProps> = ({ onSendToSimulator 
           onApplyToCopywriter={handleApplyFromEngine}
           onSendToSimulator={onSendToSimulator}
         />
+      )}
+
+      {/* VIEW 3: BULK TITLE OPTIMIZER */}
+      {activeSubTab === 'bulk_title_optimizer' && (
+        <BulkTitleOptimizer onSendToSimulator={onSendToSimulator} />
       )}
 
       {/* VIEW 2: CTR TITLES & COPYWRITER */}

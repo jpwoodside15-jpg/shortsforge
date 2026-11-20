@@ -23,6 +23,12 @@ import {
   RetentionDataPoint,
   parseYouTubeAnalyticsCsv
 } from '../data/retentionSampleData';
+import {
+  RetentionFixType,
+  RetentionRepairPayload,
+  getFixTypeLabel,
+  inferRecommendedFixType
+} from '../utils/retentionRepair';
 
 export interface ActiveClipInput {
   id: string;
@@ -115,6 +121,7 @@ interface VideoEngagementMapProps {
   activeClip: ActiveClipInput;
   onSendToClipper?: (trimStartSec: number, trimEndSec: number, context: string) => void;
   onSendToThumbnail?: (frameUrl: string, title?: string) => void;
+  onApplyRecommendedFix?: (payload: RetentionRepairPayload) => void;
 }
 
 function buildClipEngagementProfile(
@@ -465,7 +472,8 @@ function drawThumbnailCanvas(
 export const VideoEngagementMap: React.FC<VideoEngagementMapProps> = ({
   activeClip,
   onSendToClipper,
-  onSendToThumbnail
+  onSendToThumbnail,
+  onApplyRecommendedFix
 }) => {
   // Build unified clip catalog: current active workspace clip + sample presets
   const clips = useMemo<ClipEngagementProfile[]>(() => {
@@ -508,6 +516,7 @@ export const VideoEngagementMap: React.FC<VideoEngagementMapProps> = ({
   );
 
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
+  const [selectedFixType, setSelectedFixType] = useState<RetentionFixType>('trim_churn');
   const [hoveredCell, setHoveredCell] = useState<TimelineCell | null>(null);
   const [showCurveOverlay, setShowCurveOverlay] = useState<boolean>(true);
 
@@ -536,6 +545,59 @@ export const VideoEngagementMap: React.FC<VideoEngagementMapProps> = ({
       selectedClip.churnSegments[0]
     );
   }, [selectedClip, selectedSegmentId]);
+
+  useEffect(() => {
+    if (activeSegment) {
+      setSelectedFixType(inferRecommendedFixType(activeSegment.phase));
+    }
+  }, [activeSegment?.id]);
+
+  const buildRetentionRepairPayload = (
+    clip: ClipEngagementProfile,
+    seg: ChurnSegment,
+    overrideFixType?: RetentionFixType
+  ): RetentionRepairPayload => {
+    const fixType = overrideFixType || inferRecommendedFixType(seg.phase);
+    const samplePool = [
+      '/samples/sample_escapes.mp4',
+      '/samples/sample_fun.mp4',
+      '/samples/sample_joy.mp4',
+      '/samples/sample_meltdowns.mp4'
+    ];
+    const hash = clip.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+    const videoUrl = samplePool[hash % samplePool.length];
+
+    return {
+      nonce: Date.now(),
+      clipId: clip.id,
+      clipTitle: clip.title,
+      niche: clip.niche,
+      durationSec: clip.durationSec,
+      videoUrl,
+      segmentId: seg.id,
+      secondStart: seg.secondStart,
+      secondEnd: seg.secondEnd,
+      dropDelta: seg.dropDelta,
+      churnVelocity: seg.churnVelocity,
+      phase: seg.phase,
+      fixType,
+      fixLabel: getFixTypeLabel(fixType),
+      fixSummary: seg.fix,
+      recommendedHookText:
+        fixType === 're_hook'
+          ? `STOP SCROLLING: ${clip.title.slice(0, 38).toUpperCase()}`
+          : undefined,
+      recommendedSubtitleText:
+        fixType === 'subtitle_change'
+          ? `WAIT FOR THE ${Math.max(3, Math.round(clip.durationSec - 2))}s PAYOFF`
+          : undefined,
+      recommendedSubtitleStyle: fixType === 'subtitle_change' ? 'mrbeast' : 'hormozi',
+      retentionCurve: clip.dataPoints.map((pt) => ({
+        second: pt.second,
+        retention: pt.retention
+      }))
+    };
+  };
 
   const selectedPlan = selectedClip ? optimizedPlans[selectedClip.id] ?? null : null;
 
@@ -1214,10 +1276,23 @@ export const VideoEngagementMap: React.FC<VideoEngagementMapProps> = ({
                           </span>
                         </div>
 
-                        <div className="flex items-center justify-between sm:justify-end gap-4 font-mono tabular-nums shrink-0">
-                          <span className="text-red-400 font-semibold">
+                        <div className="flex items-center justify-between sm:justify-end gap-2 font-mono tabular-nums shrink-0">
+                          <span className="text-red-400 font-semibold mr-1">
                             -{seg.dropDelta}% (-{seg.churnVelocity}%/s)
                           </span>
+                          {onApplyRecommendedFix && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onApplyRecommendedFix(buildRetentionRepairPayload(selectedClip, seg));
+                              }}
+                              className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-[11px] font-sans font-semibold flex items-center gap-1 whitespace-nowrap cursor-pointer transition-colors"
+                            >
+                              <Wand2 className="w-3 h-3" />
+                              Apply Recommended Fix
+                            </button>
+                          )}
                           {onSendToClipper && (
                             <button
                               type="button"
@@ -1312,21 +1387,66 @@ export const VideoEngagementMap: React.FC<VideoEngagementMapProps> = ({
               )}
             </div>
 
-            {activeSegment && onSendToClipper && (
-              <button
-                type="button"
-                onClick={() =>
-                  onSendToClipper(
-                    activeSegment.secondStart,
-                    activeSegment.secondEnd,
-                    `Cut ${activeSegment.phase} churn (${activeSegment.secondStart}s-${activeSegment.secondEnd}s)`
-                  )
-                }
-                className="w-full py-2.5 px-4 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-white rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                <Scissors className="w-3.5 h-3.5 text-red-400" />
-                Open {activeSegment.secondStart}s–{activeSegment.secondEnd}s in Video Clipper
-              </button>
+            {activeSegment && (
+              <div className="space-y-2.5 pt-2 border-t border-zinc-800">
+                {onApplyRecommendedFix && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+                      <span>Fix Strategy for Pro Studio</span>
+                      <span className="text-emerald-400">{getFixTypeLabel(selectedFixType)}</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {([
+                        { id: 'trim_churn', label: 'Trim Churn' },
+                        { id: 're_hook', label: 'Re-Hook' },
+                        { id: 'subtitle_change', label: 'Subtitles' }
+                      ] as const).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setSelectedFixType(opt.id)}
+                          className={`py-1.5 px-2 rounded text-[11px] font-medium border cursor-pointer transition-colors ${
+                            selectedFixType === opt.id
+                              ? 'bg-zinc-800 border-red-500/60 text-white'
+                              : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onApplyRecommendedFix(
+                          buildRetentionRepairPayload(selectedClip, activeSegment, selectedFixType)
+                        )
+                      }
+                      className="w-full py-2.5 px-4 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                    >
+                      <Wand2 className="w-3.5 h-3.5" />
+                      Apply Recommended Fix in Pro Studio
+                    </button>
+                  </div>
+                )}
+
+                {onSendToClipper && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onSendToClipper(
+                        activeSegment.secondStart,
+                        activeSegment.secondEnd,
+                        `Cut ${activeSegment.phase} churn (${activeSegment.secondStart}s-${activeSegment.secondEnd}s)`
+                      )
+                    }
+                    className="w-full py-2 px-4 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <Scissors className="w-3.5 h-3.5 text-red-400" />
+                    Open {activeSegment.secondStart}s–{activeSegment.secondEnd}s in Video Clipper
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>

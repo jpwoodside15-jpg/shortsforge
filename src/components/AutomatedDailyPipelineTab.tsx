@@ -1,13 +1,19 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
 import { 
   Calendar, Clock, Zap, Play, CheckCircle2, AlertCircle, Sparkles, 
   Flame, Radio, Bell, Settings2, HelpCircle, BookOpen, Layers, 
   ArrowRight, ArrowLeft, RefreshCw, Download, Copy, ExternalLink, 
   ShieldCheck, DollarSign, Eye, Film, Scissors, Plus, Trash2, 
   Edit3, ChevronRight, BarChart3, TrendingUp, Sliders, Check,
-  Tv, MessageSquare, Volume2, ShieldAlert, Award, Compass, Target, AlertTriangle, Send
+  Tv, MessageSquare, Volume2, ShieldAlert, Award, Compass, Target, AlertTriangle, Send, KeyRound
 } from 'lucide-react';
 import { playSoundEffect } from '../utils/soundEffects';
+import {
+  applyAwinAffiliateMetadata,
+  hasValidAwinAffiliateLink,
+  resolveAwinMerchantForNiche
+} from '../utils/awinAffiliate';
 import {
   PipelineState,
   PipelineStep,
@@ -27,6 +33,7 @@ import {
 import { recordPublishedVideoToLedger } from '../utils/revenueLedgerStore';
 import { BulkVideoProcessor } from './BulkVideoProcessor';
 import { ForensicsDashboard } from './ForensicsDashboard';
+import { YouTubeOAuthSettingsPanel } from './YouTubeOAuthSettingsPanel';
 
 export interface QueuedShort {
   id: string;
@@ -51,6 +58,8 @@ export interface QueuedShort {
   description: string;
   videoUrl?: string;
   affiliateDisclosure?: boolean;
+  affiliateLink?: string;
+  affiliateMerchant?: string;
   verifierBlockedReason?: string;
   verifierRepairAction?: PipelineStep | null;
   videoId?: string;
@@ -93,12 +102,9 @@ export function buildQueueItemPipelineState(item: QueuedShort): PipelineState {
     item.complianceStatus?.toLowerCase().includes('certified') ||
     item.complianceStatus?.toLowerCase().includes('green')
   );
-  const hasAffiliateLink = Boolean(
-    item.affiliateDisclosure ||
-    /https?:\/\/|affiliate|seed-bank|#ad\b|#sponsored\b|pinned in comments/i.test(
-      item.description || ''
-    )
-  );
+  // Strictly verify a real awin1.com/cread.php URL (with awinmid & awinaffid=2863987), not arbitrary text
+  const combinedAffiliateText = `${item.description || ''} ${item.affiliateLink || ''}`;
+  const hasRealAwinAffiliateLink = hasValidAwinAffiliateLink(combinedAffiliateText);
   const hasVideoFile = Boolean(item.videoUrl?.trim() || item.videoId?.trim());
 
   return {
@@ -112,7 +118,7 @@ export function buildQueueItemPipelineState(item: QueuedShort): PipelineState {
       typeof item.safeZonesVerified === 'boolean' ? item.safeZonesVerified : complianceCleared,
     brand_kit_applied:
       typeof item.brandKitApplied === 'boolean' ? item.brandKitApplied : complianceCleared,
-    affiliate_links_present: hasAffiliateLink,
+    affiliate_links_present: hasRealAwinAffiliateLink,
     metadata_complete: Boolean(
       item.title?.trim() &&
       item.description?.trim() &&
@@ -193,18 +199,25 @@ export function createInitialWeekQueue(): QueuedShort[] {
   ];
 
   const sampleVideos = [
-    '/samples/sample_blazes.mp4',
     '/samples/sample_escapes.mp4',
     '/samples/sample_fun.mp4',
     '/samples/sample_joy.mp4',
     '/samples/sample_meltdowns.mp4',
-    '/samples/sample_blazes.mp4',
-    '/samples/sample_escapes.mp4'
+    '/samples/sample_escapes.mp4',
+    '/samples/sample_fun.mp4',
+    '/samples/sample_joy.mp4'
   ];
 
   const weekSlots: QueuedShort[] = days.map((day, idx) => {
     const template = preMadeTitles[idx];
     const date = new Date(Date.now() + idx * 86400000);
+    const baseDescription = `High-retention breakdown of ${template.title}.\n\n#shorts #viral #tech #creator\n📌 Tools and blueprint list pinned in comments!`;
+    const awinMeta = applyAwinAffiliateMetadata({
+      niche: template.niche,
+      description: baseDescription,
+      affiliateDisclosure: true
+    });
+
     return {
       id: `queue_${idx + 1}`,
       dayName: day,
@@ -225,9 +238,11 @@ export function createInitialWeekQueue(): QueuedShort[] {
       safeZonesVerified: true,
       brandKitApplied: true,
       tags: ['shorts', 'tech', 'ai', 'viral', 'algorithm', 'explained'],
-      description: `High-retention breakdown of ${template.title}.\n\n#shorts #viral #tech #creator\n📌 Tools and blueprint list pinned in comments!`,
+      description: awinMeta.description,
       videoUrl: sampleVideos[idx],
-      affiliateDisclosure: true,
+      affiliateDisclosure: awinMeta.affiliateDisclosure,
+      affiliateLink: awinMeta.affiliateLink,
+      affiliateMerchant: awinMeta.affiliateMerchant,
       videoId: undefined
     };
   });
@@ -243,9 +258,14 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
   onNavigateTab
 }) => {
   // Navigation
-  const [activeMenu, setActiveMenu] = useState<'queue' | 'bulk_processor' | 'retention_goals' | 'retention' | 'newsflash' | 'wizards' | 'guides'>('queue');
+  const [activeMenu, setActiveMenu] = useState<'queue' | 'bulk_processor' | 'retention_goals' | 'retention' | 'newsflash' | 'wizards' | 'guides' | 'oauth_settings'>('queue');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [oauthFallbackNotice, setOauthFallbackNotice] = useState<{
+    code: string;
+    message: string;
+    missingCredentials?: string[];
+  } | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -500,6 +520,90 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
     playSoundEffect('whoosh', 0.4);
 
     try {
+      let useSimulationFallback = isSimulation;
+
+      // Attempt real YouTube Data API v3 resumable upload first (after verifyBeforeUpload passed)
+      if (!isSimulation) {
+        const uploadRes = await fetch('/api/youtube/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metadata: {
+              ...item,
+              privacyStatus: 'public',
+              categoryId: '27',
+              isMadeForKids: false,
+              verifierGatePassed: true
+            }
+          })
+        });
+        const uploadData = await uploadRes.json();
+
+        if (uploadRes.ok && uploadData.success && uploadData.videoId) {
+          setOauthFallbackNotice(null);
+          const realLog: PipelineTriggerLog = {
+            executionId: 'yt_resumable_' + Date.now(),
+            itemId: item.id,
+            title: item.title,
+            scheduledTime: item.scheduledTime,
+            triggeredAt: uploadData.publishedAt || new Date().toISOString(),
+            triggeredAtFormatted: new Date().toLocaleTimeString(),
+            status: 'PUBLISHED_LIVE',
+            videoId: uploadData.videoId,
+            shortUrl: uploadData.shortUrl,
+            studioUrl: uploadData.studioUrl,
+            isSimulated: false,
+            complianceChecks: {
+              safeZoneCleared: true,
+              ftcMonetizationDisclosed: Boolean(uploadData.compliance?.ftcDisclosed),
+              coppaCompliant: Boolean(uploadData.compliance?.coppaDeclared),
+              titleLengthOptimal: Boolean(uploadData.compliance?.compliantTitle),
+              greenDollarState: uploadData.compliance?.greenDollarEligible ? 'ACTIVE' : 'REVIEW'
+            },
+            algorithmFeedback: 'Uploaded via YouTube Data API v3 resumable OAuth session.'
+          };
+          setTriggerLogs(prev => [realLog, ...prev]);
+          setQueue(prev => prev.map(q => q.id === item.id ? {
+            ...q,
+            status: 'Published',
+            verifierBlockedReason: undefined,
+            verifierRepairAction: null,
+            videoId: realLog.videoId,
+            shortUrl: realLog.shortUrl,
+            publishedAt: realLog.triggeredAtFormatted
+          } : q));
+          recordPublishedVideoToLedger({
+            videoId: realLog.videoId,
+            title: item.title,
+            niche: item.niche,
+            viewsProjected: item.viewsProjected,
+            estimatedCpm: item.estimatedCpm
+          });
+          playSoundEffect('chime', 0.6);
+          if (!options?.skipSummaryToast) {
+            showToast(`Published "${item.title.slice(0, 32)}..." live via YouTube Data API v3!`);
+          }
+          return { uploaded: true };
+        }
+
+        if (
+          uploadData.code === 'MISSING_YOUTUBE_OAUTH_CREDENTIALS' ||
+          uploadData.fallbackSimulationAvailable
+        ) {
+          useSimulationFallback = true;
+          setOauthFallbackNotice({
+            code: uploadData.code || 'MISSING_YOUTUBE_OAUTH_CREDENTIALS',
+            message:
+              uploadData.error ||
+              'YouTube OAuth credentials are missing in .env. Falling back to simulation upload.',
+            missingCredentials: uploadData.missingCredentials
+          });
+        } else {
+          throw new Error(uploadData.error || 'YouTube upload failed');
+        }
+      }
+
+      // Existing simulation fallback path
       const res = await fetch('/api/pipeline/auto-trigger', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -509,7 +613,7 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
           description: item.description,
           tags: item.tags,
           scheduledTime: item.scheduledTime,
-          isSimulated: isSimulation
+          isSimulated: useSimulationFallback
         })
       });
 
@@ -534,7 +638,11 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
         });
         playSoundEffect('chime', 0.6);
         if (!options?.skipSummaryToast) {
-          showToast(`🚀 Successfully published "${item.title.slice(0, 32)}..." via YouTube API!`);
+          showToast(
+            useSimulationFallback && !isSimulation
+              ? `YouTube OAuth .env missing — simulated upload for "${item.title.slice(0, 28)}..."`
+              : `Successfully published "${item.title.slice(0, 32)}..." via YouTube API!`
+          );
         }
         return { uploaded: true };
       }
@@ -660,9 +768,24 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
       });
       const data = await res.json();
       if (data.success && data.queue && data.queue.length > 0) {
-        setQueue(data.queue);
+        const enrichedQueue: QueuedShort[] = data.queue.map((slot: QueuedShort) => {
+          const awinMeta = applyAwinAffiliateMetadata({
+            niche: slot.niche || selectedNiche,
+            description: slot.description || '',
+            affiliateDisclosure: true
+          });
+          return {
+            ...slot,
+            niche: slot.niche || selectedNiche,
+            description: awinMeta.description,
+            affiliateDisclosure: awinMeta.affiliateDisclosure,
+            affiliateLink: awinMeta.affiliateLink,
+            affiliateMerchant: awinMeta.affiliateMerchant
+          };
+        });
+        setQueue(enrichedQueue);
         playSoundEffect('chime', 0.5);
-        showToast(`Generated a fresh 7-day high-retention queue for ${selectedNiche}!`);
+        showToast(`Generated a fresh 7-day high-retention queue for ${selectedNiche} with Awin #ad affiliate links!`);
       }
     } catch (err) {
       console.warn('Week generator fallback:', err);
@@ -861,11 +984,17 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
     }
   };
 
-  // Inject News Flash into Day's Queue
+  // Inject News Flash into Day's Queue (auto-inserts mapped Awin link + #ad in metadata step)
   const handleInjectNewsToDay = (dayIndex: number) => {
     if (!generatedNewsFlash) return;
     setQueue(prev => prev.map((item, idx) => {
       if (idx === dayIndex) {
+        const rawDescription = `${generatedNewsFlash.urgentHook}\n\n${generatedNewsFlash.bulletFacts.map(b => `• ${b.factText}`).join('\n')}\n\n#shorts #breaking #${newsCategory.toLowerCase().replace(/[^a-z]/g, '')}\n📌 Comment your thoughts below!`;
+        const awinMeta = applyAwinAffiliateMetadata({
+          niche: item.niche || newsCategory,
+          description: rawDescription,
+          affiliateDisclosure: true
+        });
         return {
           ...item,
           title: generatedNewsFlash.suggestedTitle,
@@ -875,13 +1004,49 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
           retentionScore: 98,
           viewsProjected: '920,000 Views',
           estimatedCpm: '$9.80',
-          description: `${generatedNewsFlash.urgentHook}\n\n${generatedNewsFlash.bulletFacts.map(b => `• ${b.factText}`).join('\n')}\n\n#shorts #breaking #${newsCategory.toLowerCase().replace(/[^a-z]/g, '')}\n📌 Comment your thoughts below!`
+          description: awinMeta.description,
+          affiliateDisclosure: awinMeta.affiliateDisclosure,
+          affiliateLink: awinMeta.affiliateLink,
+          affiliateMerchant: awinMeta.affiliateMerchant
         };
       }
       return item;
     }));
     playSoundEffect('chime', 0.6);
-    showToast(`Injected Smart News Flash into ${queue[dayIndex].dayName}'s scheduled slot!`);
+    showToast(`Injected Smart News Flash with Awin affiliate metadata into ${queue[dayIndex].dayName}'s slot!`);
+  };
+
+  // Repair Quarantined Slot Metadata by auto-inserting mapped Awin link + #ad
+  const handleAutoRepairAwinMetadata = (itemId: string) => {
+    const target = queue.find((q) => q.id === itemId);
+    if (!target) return;
+    const awinMeta = applyAwinAffiliateMetadata({
+      niche: target.niche,
+      description: target.description,
+      affiliateDisclosure: true
+    });
+    if (!awinMeta.mapped) {
+      showToast(`No Awin merchant mapping configured for niche "${target.niche}".`);
+      return;
+    }
+    setQueue((prev) =>
+      prev.map((q) =>
+        q.id === itemId
+          ? {
+              ...q,
+              status: 'Ready',
+              description: awinMeta.description,
+              affiliateLink: awinMeta.affiliateLink,
+              affiliateMerchant: awinMeta.affiliateMerchant,
+              affiliateDisclosure: true,
+              verifierBlockedReason: undefined,
+              verifierRepairAction: null
+            }
+          : q
+      )
+    );
+    playSoundEffect('chime', 0.5);
+    showToast(`Inserted ${awinMeta.affiliateMerchant} Awin link + #ad and moved slot back to Pending!`);
   };
 
   // Export 7-Day Blueprint
@@ -1083,6 +1248,35 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
         </div>
       )}
 
+      {/* YouTube OAuth Missing Credentials / Fallback Notice */}
+      {oauthFallbackNotice && (
+        <div className="p-4 bg-amber-950/50 border border-amber-500/40 rounded-xl text-xs text-amber-200 space-y-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-bold text-amber-300">
+              <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>YouTube Data API v3 Fallback ({oauthFallbackNotice.code})</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setActiveMenu('oauth_settings')}
+                className="text-amber-300 hover:text-white underline font-semibold cursor-pointer"
+              >
+                Open YouTube OAuth Settings
+              </button>
+              <button
+                type="button"
+                onClick={() => setOauthFallbackNotice(null)}
+                className="text-zinc-400 hover:text-white cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+          <p className="font-mono text-[11px] text-amber-100/90">{oauthFallbackNotice.message}</p>
+        </div>
+      )}
+
       {/* Pipeline Overview Kanban Board Widget */}
       {(() => {
         const pendingItems = queue.filter(
@@ -1148,57 +1342,94 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {columns.map((col) => (
-                <div
-                  key={col.key}
-                  className={`bg-zinc-900/60 border ${col.borderClass} rounded-xl p-3 space-y-2.5`}
-                >
-                  <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
-                    <div className="flex items-center gap-2">
-                      <span className={`w-2 h-2 rounded-full ${col.dotClass}`} />
-                      <span className="text-xs font-bold text-white">{col.label}</span>
+            <LayoutGroup id="pipeline-kanban-board">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {columns.map((col) => (
+                  <motion.div
+                    key={col.key}
+                    layout
+                    transition={{ layout: { type: 'spring', stiffness: 420, damping: 32 } }}
+                    className={`bg-zinc-900/60 border ${col.borderClass} rounded-xl p-3 space-y-2.5`}
+                  >
+                    <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2 h-2 rounded-full ${col.dotClass}`} />
+                        <span className="text-xs font-bold text-white">{col.label}</span>
+                      </div>
+                      <motion.span
+                        key={`${col.key}-count-${col.items.length}`}
+                        initial={{ scale: 0.85, opacity: 0.6 }}
+                        animate={{ scale: 1, opacity: 1 }}
+                        transition={{ duration: 0.16 }}
+                        className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${col.badgeClass}`}
+                      >
+                        {col.items.length}
+                      </motion.span>
                     </div>
-                    <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${col.badgeClass}`}>
-                      {col.items.length}
-                    </span>
-                  </div>
 
-                  {col.items.length === 0 ? (
-                    <div className="text-[11px] text-zinc-500 font-mono py-3 text-center">
-                      {col.emptyText}
-                    </div>
-                  ) : (
-                    <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                      {col.items.map((item) => (
-                        <div
-                          key={item.id}
-                          className="p-2.5 rounded-lg bg-zinc-950/90 border border-zinc-800/90 space-y-1"
-                        >
-                          <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
-                            <span>{item.dayName} · {item.scheduledTime}</span>
-                            <span className="text-zinc-500">{item.niche}</span>
-                          </div>
-                          <div className="text-xs font-semibold text-white line-clamp-1">
-                            {item.title}
-                          </div>
-                          {col.key === 'quarantined' && item.verifierRepairAction && (
-                            <div className="text-[10px] font-mono text-rose-300">
-                              REPAIR via {item.verifierRepairAction}
-                            </div>
-                          )}
-                          {col.key === 'uploaded' && item.videoId && (
-                            <div className="text-[10px] font-mono text-emerald-400">
-                              ID: {item.videoId}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
+                    {col.items.length === 0 ? (
+                      <motion.div
+                        layout
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="text-[11px] text-zinc-500 font-mono py-3 text-center"
+                      >
+                        {col.emptyText}
+                      </motion.div>
+                    ) : (
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        <AnimatePresence mode="popLayout" initial={false}>
+                          {col.items.map((item) => (
+                            <motion.div
+                              key={item.id}
+                              layout
+                              layoutId={`kanban-card-${item.id}`}
+                              initial={{ opacity: 0, scale: 0.96, y: 6 }}
+                              animate={{ opacity: 1, scale: 1, y: 0 }}
+                              exit={{ opacity: 0, scale: 0.95, y: -6 }}
+                              transition={{
+                                layout: { type: 'spring', stiffness: 420, damping: 32 },
+                                opacity: { duration: 0.18 }
+                              }}
+                              className="p-2.5 rounded-lg bg-zinc-950/90 border border-zinc-800/90 space-y-1"
+                            >
+                              <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
+                                <span>{item.dayName} · {item.scheduledTime}</span>
+                                <span className="text-zinc-500">{item.niche}</span>
+                              </div>
+                              <div className="text-xs font-semibold text-white line-clamp-1">
+                                {item.title}
+                              </div>
+                              {col.key === 'quarantined' && item.verifierRepairAction && (
+                                <div className="flex items-center justify-between gap-2 pt-0.5">
+                                  <span className="text-[10px] font-mono text-rose-300">
+                                    REPAIR via {item.verifierRepairAction}
+                                  </span>
+                                  {item.verifierRepairAction === 'METADATA' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAutoRepairAwinMetadata(item.id)}
+                                      className="text-[10px] font-mono font-semibold text-amber-300 hover:text-white underline cursor-pointer"
+                                    >
+                                      Auto-Insert Awin Link
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                              {col.key === 'uploaded' && item.videoId && (
+                                <div className="text-[10px] font-mono text-emerald-400">
+                                  ID: {item.videoId}
+                                </div>
+                              )}
+                            </motion.div>
+                          ))}
+                        </AnimatePresence>
+                      </div>
+                    )}
+                  </motion.div>
+                ))}
+              </div>
+            </LayoutGroup>
           </div>
         );
       })()}
@@ -1213,7 +1444,8 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
             { id: 'retention', label: 'Audience Retention Timing', icon: Clock, badge: optimalTime },
             { id: 'newsflash', label: 'Smart News Flash Studio', icon: Tv, badge: 'Daily Breaking' },
             { id: 'wizards', label: 'Interactive Wizards', icon: Sparkles, badge: '3 Available' },
-            { id: 'guides', label: 'Operating Playbooks & Guides', icon: BookOpen, badge: '5 Playbooks' }
+            { id: 'guides', label: 'Operating Playbooks & Guides', icon: BookOpen, badge: '5 Playbooks' },
+            { id: 'oauth_settings', label: 'YouTube OAuth Settings', icon: KeyRound, badge: '.env' }
           ].map((menuItem) => {
             const Icon = menuItem.icon;
             const isActive = activeMenu === menuItem.id;
@@ -2866,7 +3098,12 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
       )}
 
       {/* =========================================================================
-          SECTION 5: OPERATING PLAYBOOKS & GUIDES
+          SECTION 5: YOUTUBE OAUTH SETTINGS (.env)
+          ========================================================================= */}
+      {activeMenu === 'oauth_settings' && <YouTubeOAuthSettingsPanel />}
+
+      {/* =========================================================================
+          SECTION 6: OPERATING PLAYBOOKS & GUIDES
           ========================================================================= */}
       {activeMenu === 'guides' && (
         <div className="space-y-6">
@@ -2973,14 +3210,86 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Niche Tag (Awin Mapping):</label>
+                  <input
+                    type="text"
+                    value={editingItem.niche}
+                    onChange={(e) => setEditingItem({ ...editingItem, niche: e.target.value })}
+                    className="w-full bg-zinc-900 border border-zinc-700 rounded-lg p-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Scheduled Time:</label>
+                  <input
+                    type="text"
+                    value={editingItem.scheduledTime}
+                    onChange={(e) => setEditingItem({ ...editingItem, scheduledTime: e.target.value })}
+                    className="w-full bg-zinc-900 border border-zinc-700 rounded-lg p-2 text-white font-mono"
+                  />
+                </div>
+              </div>
+
               <div>
-                <label className="text-zinc-400 block mb-1">Scheduled Time:</label>
-                <input
-                  type="text"
-                  value={editingItem.scheduledTime}
-                  onChange={(e) => setEditingItem({ ...editingItem, scheduledTime: e.target.value })}
-                  className="w-full bg-zinc-900 border border-zinc-700 rounded-lg p-2 text-white font-mono"
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-zinc-400">Description &amp; Awin Affiliate Metadata:</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const enriched = applyAwinAffiliateMetadata({
+                        niche: editingItem.niche,
+                        description: editingItem.description,
+                        affiliateDisclosure: true
+                      });
+                      if (!enriched.mapped) {
+                        showToast(`No Awin merchant mapping for niche "${editingItem.niche}".`);
+                        return;
+                      }
+                      setEditingItem({
+                        ...editingItem,
+                        description: enriched.description,
+                        affiliateLink: enriched.affiliateLink,
+                        affiliateMerchant: enriched.affiliateMerchant,
+                        affiliateDisclosure: true
+                      });
+                      playSoundEffect('pulse', 0.3);
+                    }}
+                    className="text-[11px] font-mono font-semibold text-emerald-400 hover:text-emerald-300 underline cursor-pointer"
+                  >
+                    Auto-Insert Awin Link + #ad
+                  </button>
+                </div>
+                <textarea
+                  rows={4}
+                  value={editingItem.description}
+                  onChange={(e) =>
+                    setEditingItem({
+                      ...editingItem,
+                      description: e.target.value,
+                      affiliateLink: hasValidAwinAffiliateLink(e.target.value)
+                        ? editingItem.affiliateLink
+                        : undefined
+                    })
+                  }
+                  className="w-full bg-zinc-900 border border-zinc-700 rounded-lg p-2 text-white font-mono text-[11px]"
                 />
+                <div className="mt-1 flex items-center justify-between text-[10px] font-mono">
+                  <span className="text-zinc-500">
+                    Mapped Merchant: {resolveAwinMerchantForNiche(editingItem.niche)?.merchantName || 'Unmapped'}
+                  </span>
+                  <span
+                    className={
+                      hasValidAwinAffiliateLink(`${editingItem.description || ''} ${editingItem.affiliateLink || ''}`)
+                        ? 'text-emerald-400'
+                        : 'text-rose-400'
+                    }
+                  >
+                    {hasValidAwinAffiliateLink(`${editingItem.description || ''} ${editingItem.affiliateLink || ''}`)
+                      ? 'Valid awin1.com URL verified'
+                      : 'Missing valid awin1.com/cread.php URL'}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -2993,10 +3302,13 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
               </button>
               <button
                 onClick={() => {
-                  setQueue(prev => prev.map(q => q.id === editingItem.id ? editingItem : q));
+                  const finalItem = hasValidAwinAffiliateLink(editingItem.description)
+                    ? { ...editingItem, status: editingItem.status === 'Quarantined' ? 'Ready' as const : editingItem.status }
+                    : editingItem;
+                  setQueue(prev => prev.map(q => q.id === finalItem.id ? finalItem : q));
                   setEditingItem(null);
                   playSoundEffect('pulse', 0.3);
-                  showToast('Updated queued short schedule details!');
+                  showToast('Updated queued short metadata & schedule details!');
                 }}
                 className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold cursor-pointer"
               >

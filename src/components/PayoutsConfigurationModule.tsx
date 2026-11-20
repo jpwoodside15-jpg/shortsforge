@@ -181,9 +181,11 @@ export const PayoutsConfigurationModule: React.FC<PayoutsConfigurationModuleProp
   const [isLoading, setIsLoading] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Callback URLs for OAuth provider setup
-  const [devCallbackUrl, setDevCallbackUrl] = useState('https://ais-dev-a5wb25n34swpfam4gmrf5d-104466792707.europe-west2.run.app/auth/callback');
-  const [sharedCallbackUrl, setSharedCallbackUrl] = useState('https://ais-pre-a5wb25n34swpfam4gmrf5d-104466792707.europe-west2.run.app/auth/callback');
+  // Callback URLs for OAuth provider setup (derived dynamically from current deployment origin)
+  const defaultCallbackUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}/auth/callback` : '/auth/callback';
+  const [devCallbackUrl, setDevCallbackUrl] = useState(defaultCallbackUrl);
+  const [sharedCallbackUrl, setSharedCallbackUrl] = useState(defaultCallbackUrl);
 
   // Disbursement modal state
   const [showDisburseModal, setShowDisburseModal] = useState(false);
@@ -241,7 +243,12 @@ export const PayoutsConfigurationModule: React.FC<PayoutsConfigurationModuleProp
     // Skill requirement: listen for cross-origin postMessage from OAuth popup
     const handleMessage = (event: MessageEvent) => {
       const origin = event.origin;
-      if (!origin.endsWith('.run.app') && !origin.includes('localhost')) {
+      const isAllowedOrigin =
+        origin === window.location.origin ||
+        origin.endsWith('.vercel.app') ||
+        origin.endsWith('.run.app') ||
+        origin.includes('localhost');
+      if (!isAllowedOrigin) {
         return;
       }
       if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
