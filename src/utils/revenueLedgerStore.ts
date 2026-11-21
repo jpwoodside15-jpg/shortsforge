@@ -3,18 +3,31 @@ import { loadPipelineQueue } from './pipelineQueueStore';
 export const REVENUE_LEDGER_STORAGE_KEY = 'shortsforge_revenue_ledger_v1';
 export const REVENUE_LEDGER_UPDATED_EVENT = 'shortsforge_revenue_ledger_updated';
 
+export interface WaitlistLedgerSignup {
+  id: string;
+  email: string;
+  source: string;
+  createdAt: string;
+  ledgerEntryId: string;
+}
+
 export interface RevenueLedgerEntry {
   id: string;
   dateIso: string;
   title: string;
   niche: string;
-  source: 'Automated Daily Pipeline' | 'Daily Analytics Sync' | 'YouTube AdSense & Affiliate';
+  source:
+    | 'Automated Daily Pipeline'
+    | 'Daily Analytics Sync'
+    | 'YouTube AdSense & Affiliate'
+    | 'Waitlist Signup';
   videosPublishedDelta: number;
   viewsDelta: number;
   adSenseUsd: number;
   affiliateUsd: number;
   totalRevenueUsd: number;
   videoId?: string;
+  waitlistSignupId?: string;
   syncedAt: string;
 }
 
@@ -30,6 +43,7 @@ export interface RevenueLedgerState {
   dailySyncStreakDays: number;
   syncedVideoIds: string[];
   entries: RevenueLedgerEntry[];
+  waitlistSignups?: WaitlistLedgerSignup[];
 }
 
 export type AchievementMetric =
@@ -226,7 +240,8 @@ function createSeededRevenueLedger(): RevenueLedgerState {
     lastDailySyncDateIso: yesterdayIso,
     dailySyncStreakDays: 6,
     syncedVideoIds: [],
-    entries
+    entries,
+    waitlistSignups: []
   };
 }
 
@@ -501,3 +516,56 @@ export async function runDailyAnalyticsSync(): Promise<{
     }
   };
 }
+
+export function recordWaitlistSignupToLedger(payload: {
+  id: string;
+  email: string;
+  createdAt: string;
+  ledgerEntry?: Partial<RevenueLedgerEntry>;
+}): RevenueLedgerState {
+  const prev = loadRevenueLedger();
+  const existingSignups = Array.isArray(prev.waitlistSignups) ? prev.waitlistSignups : [];
+  const normalizedEmail = payload.email.trim().toLowerCase();
+
+  if (existingSignups.some((s) => s.email.toLowerCase() === normalizedEmail)) {
+    return prev;
+  }
+
+  const syncedAt = payload.createdAt || new Date().toISOString();
+  const ledgerEntryId =
+    payload.ledgerEntry?.id ||
+    `ledger_waitlist_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+  const entry: RevenueLedgerEntry = {
+    id: ledgerEntryId,
+    dateIso: payload.ledgerEntry?.dateIso || syncedAt.split('T')[0],
+    title: payload.ledgerEntry?.title || `Waitlist Early Access Signup (${normalizedEmail})`,
+    niche: payload.ledgerEntry?.niche || 'Landing Page Waitlist',
+    source: 'Waitlist Signup',
+    videosPublishedDelta: 0,
+    viewsDelta: 0,
+    adSenseUsd: 0,
+    affiliateUsd: 0,
+    totalRevenueUsd: 0,
+    waitlistSignupId: payload.id,
+    syncedAt
+  };
+
+  const signupRecord: WaitlistLedgerSignup = {
+    id: payload.id,
+    email: normalizedEmail,
+    source: 'landing_waitlist_banner',
+    createdAt: syncedAt,
+    ledgerEntryId
+  };
+
+  const nextState: RevenueLedgerState = {
+    ...prev,
+    entries: [entry, ...prev.entries].slice(0, 60),
+    waitlistSignups: [signupRecord, ...existingSignups].slice(0, 500)
+  };
+
+  saveRevenueLedger(nextState);
+  return nextState;
+}
+

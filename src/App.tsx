@@ -31,6 +31,7 @@ import { SyncToSocialModule } from './components/SyncToSocialModule';
 import { WorldWondersTab, WorldWonderAutoEditPayload } from './components/WorldWondersTab';
 import { ForensicsDashboard } from './components/ForensicsDashboard';
 import { ProStudio } from './components/ProStudio';
+import { WaitlistBanner } from './components/WaitlistBanner';
 import type { RetentionRepairPayload } from './utils/retentionRepair';
 import { 
   Flame, Scissors, Video, Search, DollarSign, Terminal, 
@@ -134,6 +135,9 @@ export default function App() {
       {/* Main Workspace Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
         
+        {/* Landing Page Early-Access Waitlist Banner */}
+        <WaitlistBanner />
+
         {/* Metric Bar / Algorithm Golden Rules */}
         <div className="mb-6 grid grid-cols-2 md:grid-cols-4 gap-3">
           <div className="bg-zinc-900/60 border border-zinc-800/80 rounded-xl p-3 flex items-center gap-3">

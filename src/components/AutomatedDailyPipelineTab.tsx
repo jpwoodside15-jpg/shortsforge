@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
 import { 
   Calendar, Clock, Zap, Play, CheckCircle2, AlertCircle, Sparkles, 
   Flame, Radio, Bell, Settings2, HelpCircle, BookOpen, Layers, 
@@ -34,6 +33,11 @@ import { recordPublishedVideoToLedger } from '../utils/revenueLedgerStore';
 import { BulkVideoProcessor } from './BulkVideoProcessor';
 import { ForensicsDashboard } from './ForensicsDashboard';
 import { YouTubeOAuthSettingsPanel } from './YouTubeOAuthSettingsPanel';
+import {
+  PipelineKanbanBoard,
+  KanbanColumnKey,
+  KanbanRevalidationFeedback
+} from './PipelineKanbanBoard';
 
 export interface QueuedShort {
   id: string;
@@ -341,6 +345,8 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
   const [lastPipelineSyncAt, setLastPipelineSyncAt] = useState<string>(() =>
     new Date().toLocaleTimeString()
   );
+  const [lastKanbanRevalidation, setLastKanbanRevalidation] =
+    useState<KanbanRevalidationFeedback | null>(null);
   const [isGeneratingWeek, setIsGeneratingWeek] = useState<boolean>(false);
   const [triggerLogs, setTriggerLogs] = useState<PipelineTriggerLog[]>([
     {
@@ -1049,6 +1055,208 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
     showToast(`Inserted ${awinMeta.affiliateMerchant} Awin link + #ad and moved slot back to Pending!`);
   };
 
+  // Manual Drag-and-Drop Re-Validation across Pending, Quarantined, and Uploaded Kanban columns
+  const handleKanbanDropRevalidate = async (
+    item: QueuedShort,
+    fromColumn: KanbanColumnKey,
+    toColumn: KanbanColumnKey
+  ) => {
+    const timestamp = new Date().toLocaleTimeString();
+
+    if (toColumn === 'uploaded') {
+      const outcome = await handleTriggerUpload(item);
+      if (outcome.uploaded) {
+        setLastKanbanRevalidation({
+          itemId: item.id,
+          itemTitle: item.title,
+          fromColumn,
+          toColumn,
+          verdict: 'PROCEED',
+          summary: 'Passed pre-upload verifier gate and dispatched to Uploaded.',
+          repairAction: null,
+          timestamp
+        });
+      } else if (outcome.blockedResult) {
+        setLastKanbanRevalidation({
+          itemId: item.id,
+          itemTitle: item.title,
+          fromColumn,
+          toColumn,
+          verdict: 'BLOCKED',
+          summary: outcome.blockedResult.message,
+          repairAction: outcome.blockedResult.repairAction,
+          timestamp
+        });
+      } else {
+        setLastKanbanRevalidation({
+          itemId: item.id,
+          itemTitle: item.title,
+          fromColumn,
+          toColumn,
+          verdict: 'BLOCKED',
+          summary: `Retention score (${item.retentionScore}%) is below minimum publishing floor (${minViableRetentionPublish}%).`,
+          repairAction: null,
+          timestamp
+        });
+      }
+      return;
+    }
+
+    const pipelineState = buildQueueItemPipelineState(item);
+    const verification = verifyBeforeUpload(pipelineState);
+    writeToBatchForensicsLog(
+      'Automated Daily Pipeline',
+      `${item.title} [Kanban Manual Re-Validation]`,
+      verification
+    );
+
+    if (toColumn === 'pending') {
+      // Enforce retention floor check on manual re-validation back to Pending
+      if (quarantineBelowFloor && item.retentionScore < minViableRetentionPublish) {
+        const floorReason = `Retention score (${item.retentionScore}%) is below minimum publishing floor (${minViableRetentionPublish}%).`;
+        setQueue((prev) =>
+          prev.map((q) =>
+            q.id === item.id
+              ? {
+                  ...q,
+                  status: 'Quarantined',
+                  verifierBlockedReason: floorReason
+                }
+              : q
+          )
+        );
+        setLastKanbanRevalidation({
+          itemId: item.id,
+          itemTitle: item.title,
+          fromColumn,
+          toColumn,
+          verdict: 'BLOCKED',
+          summary: floorReason,
+          repairAction: null,
+          timestamp
+        });
+        if (!retentionAlertsMuted) {
+          playSoundEffect('subdrop', 0.45);
+        }
+        showToast(
+          `Re-validation kept "${item.title.slice(0, 26)}..." in Quarantined: ${floorReason}`
+        );
+        return;
+      }
+
+      if (verification.verdict === 'BLOCKED') {
+        setQueue((prev) =>
+          prev.map((q) =>
+            q.id === item.id
+              ? {
+                  ...q,
+                  status: 'Quarantined',
+                  verifierBlockedReason: verification.message,
+                  verifierRepairAction: verification.repairAction
+                }
+              : q
+          )
+        );
+        setVerifierBlockedBanner({
+          itemTitle: item.title,
+          result: verification
+        });
+        setLastKanbanRevalidation({
+          itemId: item.id,
+          itemTitle: item.title,
+          fromColumn,
+          toColumn,
+          verdict: 'BLOCKED',
+          summary: verification.message,
+          repairAction: verification.repairAction,
+          timestamp
+        });
+        if (!retentionAlertsMuted) {
+          playSoundEffect('subdrop', 0.45);
+        }
+        showToast(`Re-validation BLOCKED: ${verification.message}`);
+        return;
+      }
+
+      // Passed all preconditions -> move to Pending (Ready)
+      setQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? {
+                ...q,
+                status: 'Ready',
+                verifierBlockedReason: undefined,
+                verifierRepairAction: null
+              }
+            : q
+        )
+      );
+      setVerifierBlockedBanner((prev) =>
+        prev?.itemTitle === item.title ? null : prev
+      );
+      setLastKanbanRevalidation({
+        itemId: item.id,
+        itemTitle: item.title,
+        fromColumn,
+        toColumn,
+        verdict: 'PROCEED',
+        summary: 'All preconditions verified — released to Pending queue.',
+        repairAction: null,
+        timestamp
+      });
+      playSoundEffect('chime', 0.5);
+      showToast(
+        `Re-validation passed (PROCEED) — moved "${item.title.slice(0, 28)}..." to Pending.`
+      );
+      return;
+    }
+
+    if (toColumn === 'quarantined') {
+      const isBlocked = verification.verdict === 'BLOCKED';
+      setQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? {
+                ...q,
+                status: 'Quarantined',
+                verifierBlockedReason: isBlocked
+                  ? verification.message
+                  : 'Manually quarantined via Kanban for pre-upload re-validation review.',
+                verifierRepairAction: isBlocked ? verification.repairAction : null
+              }
+            : q
+        )
+      );
+      setLastKanbanRevalidation({
+        itemId: item.id,
+        itemTitle: item.title,
+        fromColumn,
+        toColumn,
+        verdict: isBlocked ? 'BLOCKED' : 'PROCEED',
+        summary: isBlocked
+          ? verification.message
+          : 'Manually quarantined for review (all preconditions currently PROCEED).',
+        repairAction: isBlocked ? verification.repairAction : null,
+        timestamp
+      });
+      if (isBlocked) {
+        setVerifierBlockedBanner({
+          itemTitle: item.title,
+          result: verification
+        });
+        if (!retentionAlertsMuted) {
+          playSoundEffect('subdrop', 0.4);
+        }
+        showToast(`Quarantined & audited: ${verification.message}`);
+      } else {
+        playSoundEffect('whoosh', 0.35);
+        showToast(
+          `Manually quarantined "${item.title.slice(0, 28)}..." (all preconditions currently PROCEED). Drag back to Pending to release.`
+        );
+      }
+    }
+  };
+
   // Export 7-Day Blueprint
   const handleExportBlueprint = () => {
     const blueprintData = {
@@ -1277,162 +1485,16 @@ export const AutomatedDailyPipelineTab: React.FC<AutomatedDailyPipelineTabProps>
         </div>
       )}
 
-      {/* Pipeline Overview Kanban Board Widget */}
-      {(() => {
-        const pendingItems = queue.filter(
-          (q) => q.status === 'Scheduled' || q.status === 'Ready' || q.status === 'Uploading'
-        );
-        const quarantinedItems = queue.filter((q) => q.status === 'Quarantined');
-        const uploadedItems = queue.filter((q) => q.status === 'Published');
-
-        const columns = [
-          {
-            key: 'pending',
-            label: 'Pending',
-            items: pendingItems,
-            badgeClass: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40',
-            borderClass: 'border-indigo-500/30',
-            dotClass: 'bg-indigo-400',
-            emptyText: 'No pending slots in queue.'
-          },
-          {
-            key: 'quarantined',
-            label: 'Quarantined',
-            items: quarantinedItems,
-            badgeClass: 'bg-rose-500/20 text-rose-300 border-rose-500/40',
-            borderClass: 'border-rose-500/30',
-            dotClass: 'bg-rose-400',
-            emptyText: 'No quarantined slots.'
-          },
-          {
-            key: 'uploaded',
-            label: 'Uploaded',
-            items: uploadedItems,
-            badgeClass: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
-            borderClass: 'border-emerald-500/30',
-            dotClass: 'bg-emerald-400',
-            emptyText: 'No slots uploaded yet.'
-          }
-        ];
-
-        return (
-          <div className="bg-zinc-950/80 border border-zinc-800 rounded-2xl p-5 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Layers className="w-4 h-4 text-indigo-400" />
-                <h2 className="text-sm font-black text-white tracking-tight">Pipeline Overview</h2>
-                <span className="text-[10px] font-mono text-zinc-400 px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800">
-                  {queue.length} Total Slots
-                </span>
-                <span className="text-[10px] font-mono text-emerald-300 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  LIVE SYNC · {lastPipelineSyncAt}
-                </span>
-              </div>
-              <div className="flex items-center gap-2 text-[11px] font-mono">
-                <span className="px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                  Pending: {pendingItems.length}
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-300 border border-rose-500/30">
-                  Quarantined: {quarantinedItems.length}
-                </span>
-                <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                  Uploaded: {uploadedItems.length}
-                </span>
-              </div>
-            </div>
-
-            <LayoutGroup id="pipeline-kanban-board">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                {columns.map((col) => (
-                  <motion.div
-                    key={col.key}
-                    layout
-                    transition={{ layout: { type: 'spring', stiffness: 420, damping: 32 } }}
-                    className={`bg-zinc-900/60 border ${col.borderClass} rounded-xl p-3 space-y-2.5`}
-                  >
-                    <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
-                      <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${col.dotClass}`} />
-                        <span className="text-xs font-bold text-white">{col.label}</span>
-                      </div>
-                      <motion.span
-                        key={`${col.key}-count-${col.items.length}`}
-                        initial={{ scale: 0.85, opacity: 0.6 }}
-                        animate={{ scale: 1, opacity: 1 }}
-                        transition={{ duration: 0.16 }}
-                        className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${col.badgeClass}`}
-                      >
-                        {col.items.length}
-                      </motion.span>
-                    </div>
-
-                    {col.items.length === 0 ? (
-                      <motion.div
-                        layout
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="text-[11px] text-zinc-500 font-mono py-3 text-center"
-                      >
-                        {col.emptyText}
-                      </motion.div>
-                    ) : (
-                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                        <AnimatePresence mode="popLayout" initial={false}>
-                          {col.items.map((item) => (
-                            <motion.div
-                              key={item.id}
-                              layout
-                              layoutId={`kanban-card-${item.id}`}
-                              initial={{ opacity: 0, scale: 0.96, y: 6 }}
-                              animate={{ opacity: 1, scale: 1, y: 0 }}
-                              exit={{ opacity: 0, scale: 0.95, y: -6 }}
-                              transition={{
-                                layout: { type: 'spring', stiffness: 420, damping: 32 },
-                                opacity: { duration: 0.18 }
-                              }}
-                              className="p-2.5 rounded-lg bg-zinc-950/90 border border-zinc-800/90 space-y-1"
-                            >
-                              <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-zinc-400">
-                                <span>{item.dayName} · {item.scheduledTime}</span>
-                                <span className="text-zinc-500">{item.niche}</span>
-                              </div>
-                              <div className="text-xs font-semibold text-white line-clamp-1">
-                                {item.title}
-                              </div>
-                              {col.key === 'quarantined' && item.verifierRepairAction && (
-                                <div className="flex items-center justify-between gap-2 pt-0.5">
-                                  <span className="text-[10px] font-mono text-rose-300">
-                                    REPAIR via {item.verifierRepairAction}
-                                  </span>
-                                  {item.verifierRepairAction === 'METADATA' && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAutoRepairAwinMetadata(item.id)}
-                                      className="text-[10px] font-mono font-semibold text-amber-300 hover:text-white underline cursor-pointer"
-                                    >
-                                      Auto-Insert Awin Link
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                              {col.key === 'uploaded' && item.videoId && (
-                                <div className="text-[10px] font-mono text-emerald-400">
-                                  ID: {item.videoId}
-                                </div>
-                              )}
-                            </motion.div>
-                          ))}
-                        </AnimatePresence>
-                      </div>
-                    )}
-                  </motion.div>
-                ))}
-              </div>
-            </LayoutGroup>
-          </div>
-        );
-      })()}
+      {/* Pipeline Overview Kanban Board Widget (dnd-kit + Framer Motion layout animations) */}
+      <PipelineKanbanBoard
+        queue={queue}
+        lastPipelineSyncAt={lastPipelineSyncAt}
+        onDropBetweenColumns={handleKanbanDropRevalidate}
+        onAutoRepairAwinMetadata={handleAutoRepairAwinMetadata}
+        lastRevalidation={lastKanbanRevalidation}
+        onDismissRevalidation={() => setLastKanbanRevalidation(null)}
+        validatingItemId={executingItemId}
+      />
 
       {/* Main Tab Sub-Navigation Menu */}
       <div className="flex items-center justify-between border-b border-zinc-800 pb-3 overflow-x-auto gap-2">

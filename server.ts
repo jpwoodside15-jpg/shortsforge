@@ -1,11 +1,12 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
-import { google } from 'googleapis';
 import { GoogleGenAI, Type } from '@google/genai';
 import { TOP_100_TRENDING_SHORTS } from './src/data/trendingShortsData';
 import { BENCHMARK_COMPETITORS, generateDynamicCompetitorData } from './src/data/competitorBenchmarkData';
@@ -17,9 +18,35 @@ import { WORLD_WONDERS_LIBRARY } from './src/data/worldWondersData';
 
 dotenv.config();
 
+let cachedGoogleApis: typeof import('googleapis')['google'] | null = null;
+async function getGoogleApis() {
+  if (!cachedGoogleApis) {
+    const mod = await import('googleapis');
+    cachedGoogleApis = mod.google;
+  }
+  return cachedGoogleApis;
+}
+
+function resolveServerPort(): number {
+  const portFlagIndex = process.argv.indexOf('--port');
+  if (portFlagIndex !== -1 && process.argv[portFlagIndex + 1]) {
+    const parsedCliPort = parseInt(process.argv[portFlagIndex + 1], 10);
+    if (!Number.isNaN(parsedCliPort) && parsedCliPort > 0) {
+      return parsedCliPort;
+    }
+  }
+  if (process.env.PORT) {
+    const parsedEnvPort = parseInt(process.env.PORT, 10);
+    if (!Number.isNaN(parsedEnvPort) && parsedEnvPort > 0) {
+      return parsedEnvPort;
+    }
+  }
+  return 3000;
+}
+
 const app = express();
 app.set('trust proxy', 1);
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = resolveServerPort();
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -3960,7 +3987,7 @@ app.get('/api/youtube/oauth/status', (req, res) => {
   });
 });
 
-app.get('/api/youtube/oauth/url', (req, res) => {
+app.get('/api/youtube/oauth/url', async (req, res) => {
   const status = getYouTubeOAuthEnvStatus(req);
   if (!status.readyForConsentFlow) {
     return res.status(400).json({
@@ -3972,6 +3999,7 @@ app.get('/api/youtube/oauth/url', (req, res) => {
     });
   }
 
+  const google = await getGoogleApis();
   const oauth2Client = new google.auth.OAuth2(
     status.clientId,
     status.clientSecret,
@@ -4015,6 +4043,7 @@ app.get(['/api/youtube/oauth/callback', '/api/youtube/oauth/callback/'], async (
   }
 
   try {
+    const google = await getGoogleApis();
     const oauth2Client = new google.auth.OAuth2(
       status.clientId,
       status.clientSecret,
@@ -4199,6 +4228,7 @@ app.post('/api/youtube/upload', handleYouTubeVideoMultipart, async (req, res) =>
     }
 
     // 5. Authenticate with OAuth2 refresh token and execute YouTube Data API v3 resumable upload
+    const google = await getGoogleApis();
     const oauth2Client = new google.auth.OAuth2(
       oauthStatus.clientId,
       oauthStatus.clientSecret,
@@ -8727,6 +8757,205 @@ app.get('/api/analytics/daily-sync', (_req, res) => {
 });
 
 // =========================================================================
+// WAITLIST SIGNUPS -> EARNINGS LEDGER STORE (NO EXTERNAL SERVICES)
+// =========================================================================
+interface ServerWaitlistSignupRecord {
+  id: string;
+  email: string;
+  source: string;
+  createdAt: string;
+  ledgerEntryId: string;
+}
+
+interface ServerEarningsLedgerEntry {
+  id: string;
+  dateIso: string;
+  title: string;
+  niche: string;
+  source: 'Waitlist Signup';
+  videosPublishedDelta: number;
+  viewsDelta: number;
+  adSenseUsd: number;
+  affiliateUsd: number;
+  totalRevenueUsd: number;
+  waitlistSignupId: string;
+  syncedAt: string;
+}
+
+interface ServerEarningsLedgerStore {
+  updatedAt: string;
+  waitlistSignups: ServerWaitlistSignupRecord[];
+  entries: ServerEarningsLedgerEntry[];
+}
+
+const WAITLIST_EMAIL_REGEX = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const MAX_STORED_WAITLIST_SIGNUPS = 5000;
+
+function getEarningsLedgerStorePath(): string {
+  const baseDir = process.env.VERCEL
+    ? os.tmpdir()
+    : path.resolve(process.cwd(), '.data');
+  return path.resolve(baseDir, 'earnings-ledger-store.json');
+}
+
+let inMemoryEarningsLedgerStore: ServerEarningsLedgerStore | null = null;
+
+function readEarningsLedgerStore(): ServerEarningsLedgerStore {
+  if (inMemoryEarningsLedgerStore) {
+    return inMemoryEarningsLedgerStore;
+  }
+
+  const storePath = getEarningsLedgerStorePath();
+  try {
+    if (fs.existsSync(storePath)) {
+      const raw = fs.readFileSync(storePath, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<ServerEarningsLedgerStore>;
+      if (parsed && Array.isArray(parsed.waitlistSignups) && Array.isArray(parsed.entries)) {
+        inMemoryEarningsLedgerStore = {
+          updatedAt: parsed.updatedAt || new Date().toISOString(),
+          waitlistSignups: parsed.waitlistSignups,
+          entries: parsed.entries
+        };
+        return inMemoryEarningsLedgerStore;
+      }
+    }
+  } catch (err) {
+    console.warn('Earnings ledger store read fallback to memory:', err);
+  }
+
+  inMemoryEarningsLedgerStore = {
+    updatedAt: new Date().toISOString(),
+    waitlistSignups: [],
+    entries: []
+  };
+  return inMemoryEarningsLedgerStore;
+}
+
+function writeEarningsLedgerStore(store: ServerEarningsLedgerStore): 'disk' | 'memory' {
+  inMemoryEarningsLedgerStore = store;
+  const storePath = getEarningsLedgerStorePath();
+  try {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
+    return 'disk';
+  } catch (err) {
+    console.warn('Earnings ledger store disk write skipped; retained in memory:', err);
+    return 'memory';
+  }
+}
+
+function maskEmailForLedgerTitle(email: string): string {
+  const [localPart, domain] = email.split('@');
+  if (!localPart || !domain) return email;
+  const visible = localPart.slice(0, Math.min(2, localPart.length));
+  return `${visible}***@${domain}`;
+}
+
+app.get('/api/waitlist', (_req, res) => {
+  const store = readEarningsLedgerStore();
+  return res.json({
+    success: true,
+    totalWaitlistSignups: store.waitlistSignups.length,
+    ledgerEntriesCount: store.entries.length,
+    updatedAt: store.updatedAt
+  });
+});
+
+app.post('/api/waitlist', (req, res) => {
+  const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const rawSource =
+    typeof req.body?.source === 'string'
+      ? req.body.source.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
+      : 'landing_waitlist_banner';
+
+  if (!rawEmail) {
+    return res.status(400).json({
+      success: false,
+      code: 'EMAIL_REQUIRED',
+      error: 'Please enter an email address to join the waitlist.'
+    });
+  }
+
+  if (rawEmail.length > 254 || /[\r\n]/.test(rawEmail) || !WAITLIST_EMAIL_REGEX.test(rawEmail)) {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_EMAIL',
+      error: 'Please enter a valid email address.'
+    });
+  }
+
+  const store = readEarningsLedgerStore();
+  const existing = store.waitlistSignups.find((s) => s.email === rawEmail);
+  if (existing) {
+    const existingEntry = store.entries.find((e) => e.id === existing.ledgerEntryId) || null;
+    return res.status(200).json({
+      success: true,
+      alreadyRegistered: true,
+      message: 'This email is already on the waitlist and recorded in the earnings ledger.',
+      signup: {
+        id: existing.id,
+        email: existing.email,
+        source: existing.source,
+        createdAt: existing.createdAt
+      },
+      ledgerEntry: existingEntry,
+      totalWaitlistSignups: store.waitlistSignups.length
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const randomSuffix = crypto.randomBytes(3).toString('hex');
+  const signupId = `wl_${Date.now()}_${randomSuffix}`;
+  const ledgerEntryId = `ledger_waitlist_${Date.now()}_${randomSuffix}`;
+
+  const signupRecord: ServerWaitlistSignupRecord = {
+    id: signupId,
+    email: rawEmail,
+    source: rawSource || 'landing_waitlist_banner',
+    createdAt: nowIso,
+    ledgerEntryId
+  };
+
+  const ledgerEntry: ServerEarningsLedgerEntry = {
+    id: ledgerEntryId,
+    dateIso: nowIso.split('T')[0],
+    title: `Waitlist Early Access Signup (${maskEmailForLedgerTitle(rawEmail)})`,
+    niche: 'Landing Page Waitlist',
+    source: 'Waitlist Signup',
+    videosPublishedDelta: 0,
+    viewsDelta: 0,
+    adSenseUsd: 0,
+    affiliateUsd: 0,
+    totalRevenueUsd: 0,
+    waitlistSignupId: signupId,
+    syncedAt: nowIso
+  };
+
+  const nextStore: ServerEarningsLedgerStore = {
+    updatedAt: nowIso,
+    waitlistSignups: [signupRecord, ...store.waitlistSignups].slice(0, MAX_STORED_WAITLIST_SIGNUPS),
+    entries: [ledgerEntry, ...store.entries].slice(0, MAX_STORED_WAITLIST_SIGNUPS)
+  };
+
+  const persistedTo = writeEarningsLedgerStore(nextStore);
+
+  return res.status(201).json({
+    success: true,
+    alreadyRegistered: false,
+    persistedTo,
+    message: 'You are on the waitlist. Signup recorded in the earnings ledger.',
+    signup: {
+      id: signupRecord.id,
+      email: signupRecord.email,
+      source: signupRecord.source,
+      createdAt: signupRecord.createdAt
+    },
+    ledgerEntry,
+    totalWaitlistSignups: nextStore.waitlistSignups.length
+  });
+});
+
+// =========================================================================
 // SCRAPED TOP 100 / TOP 10 VIRAL VIDEOS LIBRARY & EDIT PRESETS
 // =========================================================================
 app.get('/api/editor/scraped-top-videos', (req, res) => {
@@ -9293,15 +9522,24 @@ async function startServer() {
     });
   } else {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : undefined,
+        watch: disableHmr ? null : undefined,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`ShortsForge AI server listening on port ${PORT}`);
+  });
+  server.on('error', (err) => {
+    console.error(`Failed to start server on port ${PORT}:`, err);
+    process.exit(1);
   });
 }
 
